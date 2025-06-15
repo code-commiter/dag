@@ -6,9 +6,11 @@
 # UPDATED to strictly separate Task.state from Task.gateStatus.
 # NOW using GateStatus.APPROVED and GateStatus.REJECTED for consistency.
 # TaskType string literals are replaced with constants for readability and maintainability.
-# Task state string literals are now also replaced with constants.
+# Task state string literals now also replaced with constants.
 # Added QUEUE_PROCESS_TYPE to control task fetching mechanism (DB, KAFKA, MOCK).
 # Removed redundant 'use_mock_kafka_data' DAG parameter.
+# ENHANCED: Actual exception messages are now included in task logs on failure.
+# NEW: Phase completion now directly triggers the next phase's first task within the DAG.
 
 from __future__ import annotations
 
@@ -118,6 +120,8 @@ def _append_task_logs_in_mongodb(db, task_id, new_log_content):
     asynchronous operations. Refactored to use `reflow_dag_utils.py` and `airflow_config.py`.
     **UPDATED to strictly separate Task.state from Task.gateStatus.**
     **NOW using GateStatus.APPROVED and GateStatus.REJECTED for consistency.**
+    **ENHANCED: Actual exception messages are now included in task logs on failure.**
+    **NEW: Phase completion now directly triggers the next phase's first task within the DAG.**
 
     **Gate Logic Refinement (Strict Separation):**
     - `Task.state` defines the workflow progression: `PLANNED`, `QUEUED`, `IN_PROGRESS`, `WAITING_FOR_APPROVAL`, `COMPLETED`, `FAILED`, etc.
@@ -161,7 +165,7 @@ def reflow_kafka_task_executor_dag_v4():
             print(f"[{APPROVER_NAME}] USING MOCK DATA: Returning a hardcoded QUEUED task for testing.")
             # Mock task for async deployment monitored by JAR
             mock_task = {
-                "id": "mock_regular_task_id",
+                "_id": "mock_regular_task_id", # Changed to _id
                 "name": "Synchronous Data Process",
                 "description": "A regular task that runs synchronously.",
                 "state": STATE_QUEUED,
@@ -179,7 +183,7 @@ def reflow_kafka_task_executor_dag_v4():
             }
 
             mock_sequential_group_task = {
-                "id": "mock_seq_group_task_id_1",
+                "_id": "mock_seq_group_task_id_1", # Changed to _id
                 "name": "Mock Sequential Group",
                 "description": "A group task that executes children sequentially.",
                 "state": STATE_QUEUED,
@@ -197,7 +201,7 @@ def reflow_kafka_task_executor_dag_v4():
             }
 
             mock_parallel_group_task = {
-                "id": "mock_par_group_task_id_1",
+                "_id": "mock_par_group_task_id_1", # Changed to _id
                 "name": "Mock Parallel Group",
                 "description": "A group task that executes children in parallel.",
                 "state": STATE_QUEUED,
@@ -216,7 +220,7 @@ def reflow_kafka_task_executor_dag_v4():
 
             # This gate is QUEUED and its gateStatus indicates it's approved.
             mock_rg_gate_task_approved = {
-                "id": "mock_rg_gate_task_id_approved",
+                "_id": "mock_rg_gate_task_id_approved", # Changed to _id
                 "name": "Suite-wide Dev Approval (Approved Gate)",
                 "description": "Mock RG-level approval gate, already approved, now QUEUED.",
                 "state": STATE_QUEUED,
@@ -235,7 +239,7 @@ def reflow_kafka_task_executor_dag_v4():
             }
 
             mock_manual_approval_gate_pending = {
-                "id": "mock_manual_approval_gate_id_1",
+                "_id": "mock_manual_approval_gate_id_1", # Changed to _id
                 "name": "Manual QA Sign-off",
                 "description": "Requires manual QA team approval.",
                 "state": STATE_QUEUED, # It's queued when it's its turn
@@ -253,7 +257,7 @@ def reflow_kafka_task_executor_dag_v4():
             }
 
             mock_trigger_task = {
-                "id": "mock_trigger_deploy_task_id",
+                "_id": "mock_trigger_deploy_task_id", # Changed to _id
                 "name": "Deploy Application (Trigger)",
                 "description": "Continuously triggers deployment script until successful.",
                 "state": STATE_QUEUED,
@@ -311,7 +315,21 @@ def reflow_kafka_task_executor_dag_v4():
 
                     try:
                         task_data = json.loads(msg.value().decode('utf-8'))
-                        task_id = task_data.get("id")
+                        
+                        # Prioritize "_id", fallback to "id" if "_id" not present
+                        task_id = task_data.get("_id")
+                        if not task_id:
+                            task_id = task_data.get("id")
+                            if task_id:
+                                # Ensure the dictionary uses "_id" consistently for downstream tasks
+                                task_data["_id"] = task_id
+                                if "id" in task_data:
+                                    del task_data["id"] # Remove the "id" key if "_id" is set from it
+                            else:
+                                print(f"[{APPROVER_NAME}] Warning: Kafka message missing both '_id' and 'id' field. Skipping: {task_data}")
+                                continue # Skip processing this malformed message
+
+
                         task_state = task_data.get("state")
                         task_name = task_data.get("name")
                         task_type = task_data.get("type")
@@ -385,7 +403,7 @@ def reflow_kafka_task_executor_dag_v4():
         JAR's stdout/stderr are captured and appended to the task's logs directly in MongoDB.
         Handles state transitions and sequential/parallel group logic.
         """
-        task_id = task_data.get("id")
+        task_id = task_data.get("_id") # Use _id for consistency with MongoDB documents
         task_name = task_data.get("name")
         phase_id = task_data.get("phaseId")
         release_id = task_data.get("releaseId")
@@ -397,7 +415,7 @@ def reflow_kafka_task_executor_dag_v4():
             mongo_client = get_mongo_client(APPROVER_NAME)
             db = mongo_client[MONGO_DB_NAME]
 
-            current_task_doc = db.tasks.find_one({"_id": task_id})
+            current_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id
             if not current_task_doc:
                 print(f"[{APPROVER_NAME}] Task {task_id} not found in DB. It might have been deleted or archived. Skipping execution.")
                 return
@@ -405,7 +423,7 @@ def reflow_kafka_task_executor_dag_v4():
             current_task_state = current_task_doc.get("state")
             current_task_is_gate = current_task_doc.get("isGate", False)
             current_task_type_db = current_task_doc.get("type")
-            current_gate_status = current_task_doc.get("gateStatus") # New: Get gateStatus
+            current_gate_status = current_task_doc.get("gateStatus")
             actor = current_task_doc.get("actor")
             
             # If the task is already in a terminal state (COMPLETED, FAILED, SKIPPED, ARCHIVED),
@@ -416,9 +434,9 @@ def reflow_kafka_task_executor_dag_v4():
                  return
 
             # --- Concurrency Control: Attempt to atomically transition from QUEUED to IN_PROGRESS ---
-            if current_task_state == STATE_QUEUED: # Using constant
+            if current_task_state == STATE_QUEUED:
                 initial_state_update_success = update_entity_state_in_mongodb(
-                    db, "tasks", task_id, STATE_IN_PROGRESS, old_state_condition=STATE_QUEUED, # Using constants
+                    db, "tasks", task_id, STATE_IN_PROGRESS, old_state_condition=STATE_QUEUED,
                     additional_fields={"reason": f"Automatically moved to IN_PROGRESS by {APPROVER_NAME}"},
                     approver_name=APPROVER_NAME
                 )
@@ -428,29 +446,29 @@ def reflow_kafka_task_executor_dag_v4():
                 current_task_state = STATE_IN_PROGRESS # Update in-memory state after successful transition
 
             # --- Handle Gate Tasks (APPROVAL type) that are IN_PROGRESS ---
-            if current_task_is_gate and current_task_type_db == TASK_TYPE_APPROVAL: # Using constant
-                if current_gate_status == GATE_STATUS_APPROVED: # Using constant
+            if current_task_is_gate and current_task_type_db == TASK_TYPE_APPROVAL:
+                if current_gate_status == GATE_STATUS_APPROVED:
                     # Gate is approved, so it "completes" its execution and triggers next
                     print(f"[{APPROVER_NAME}] Gate task {task_id} (gateStatus: APPROVED). Marking as COMPLETED and proceeding to next.")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED, # Using constant
-                        old_state_condition=STATE_IN_PROGRESS, # Assuming it transitioned to IN_PROGRESS (Using constant)
-                        additional_fields={"reason": f"Gate task passed and completed by {APPROVER_NAME}"},
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED,
+                        old_state_condition=STATE_IN_PROGRESS,
+                        additional_fields={"reason": f"Gate task passed and completed by {APPROVER_NAME}"}, # Added reason
                         approver_name=APPROVER_NAME)
                     
                     # After gate is COMPLETED, queue its next task
-                    updated_task_doc = db.tasks.find_one({"_id": task_id}) # Re-fetch updated state
+                    updated_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id, Re-fetch updated state
                     if updated_task_doc and updated_task_doc.get("nextTaskId"):
                         _queue_next_task_after_completion(db, updated_task_doc)
                     
                     _check_and_transition_parent_states(db, task_id, phase_id, current_task_doc.get("groupId"))
                     return
 
-                elif current_gate_status == GATE_STATUS_REJECTED: # Using constant
+                elif current_gate_status == GATE_STATUS_REJECTED:
                     # Gate is rejected, so it "fails" its execution and stops workflow progression
                     print(f"[{APPROVER_NAME}] Gate task {task_id} (gateStatus: REJECTED). Marking as FAILED and stopping workflow.")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, # Using constant
-                        old_state_condition=STATE_IN_PROGRESS, # Assuming it transitioned to IN_PROGRESS (Using constant)
-                        additional_fields={"reason": f"Gate task failed. ({APPROVER_NAME})"},
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                        old_state_condition=STATE_IN_PROGRESS,
+                        additional_fields={"reason": f"Gate task failed. ({APPROVER_NAME})"}, # Added reason
                         approver_name=APPROVER_NAME)
                     
                     _check_and_transition_parent_states(db, task_id, phase_id, current_task_doc.get("groupId"))
@@ -458,56 +476,56 @@ def reflow_kafka_task_executor_dag_v4():
                 
                 else: # GateStatus is null, PENDING. Task is IN_PROGRESS, but no decision made yet.
                     print(f"[{APPROVER_NAME}] Gate task {task_id} is IN_PROGRESS but gateStatus is {current_gate_status}. Setting to WAITING_FOR_APPROVAL. Not executing JAR. Waiting for external approval.")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_WAITING_FOR_APPROVAL, # Using constant
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_WAITING_FOR_APPROVAL,
                         old_state_condition=STATE_IN_PROGRESS,
-                        additional_fields={"reason": f"Gate task awaiting external approval. ({APPROVER_NAME})"},
+                        additional_fields={"reason": f"Gate task awaiting external approval. ({APPROVER_NAME})"}, # Added reason
                         approver_name=APPROVER_NAME)
                     return # Airflow task completes, will be re-queued when state changes via UI/cascading
 
 
             # --- Handle Group Tasks ---
-            if current_task_type_db in [TASK_TYPE_PARALLEL_GROUP, TASK_TYPE_SEQUENTIAL_GROUP]: # Using constants
+            if current_task_type_db in [TASK_TYPE_PARALLEL_GROUP, TASK_TYPE_SEQUENTIAL_GROUP]:
                 print(f"[{APPROVER_NAME}] Initiating group task {task_id} of type {current_task_type_db}.")
                 
                 child_task_ids = current_task_doc.get("childTaskIds", [])
                 if not child_task_ids:
                     print(f"[{APPROVER_NAME}] Warning: Group task {task_id} has no childTaskIds. Marking as COMPLETED.")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED, # Using constant
-                        additional_fields={"reason": f"Group task completed with no children by {APPROVER_NAME}"},
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED,
+                        additional_fields={"reason": f"Group task completed with no children by {APPROVER_NAME}"}, # Added reason
                         approver_name=APPROVER_NAME)
                     # When a group task completes, queue its next task in the main flow
-                    updated_group_task_doc = db.tasks.find_one({"_id": task_id}) # Re-fetch to get latest state
+                    updated_group_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id, Re-fetch to get latest state
                     if updated_group_task_doc and updated_group_task_doc.get("nextTaskId"):
                         _queue_next_task_after_completion(db, updated_group_task_doc)
                     _check_and_transition_parent_states(db, task_id, phase_id, current_task_doc.get("groupId"))
                     return
 
-                if current_task_type_db == TASK_TYPE_PARALLEL_GROUP: # Using constant
+                if current_task_type_db == TASK_TYPE_PARALLEL_GROUP:
                     print(f"[{APPROVER_NAME}] Queuing all {len(child_task_ids)} child tasks for parallel group {task_id}.")
                     for child_id in child_task_ids:
-                        child_doc = db.tasks.find_one({"_id": child_id})
-                        if child_doc and child_doc.get("state") == STATE_PLANNED: # Only queue if planned (Using constant)
-                             update_entity_state_in_mongodb(db, "tasks", child_id, STATE_QUEUED, old_state_condition=STATE_PLANNED, # Using constants
-                                additional_fields={"reason": f"Queued by {APPROVER_NAME} as part of parallel group {task_id}"},
+                        child_doc = db.tasks.find_one({"_id": child_id}) # Use _id
+                        if child_doc and child_doc.get("state") == STATE_PLANNED:
+                             update_entity_state_in_mongodb(db, "tasks", child_id, STATE_QUEUED, old_state_condition=STATE_PLANNED,
+                                additional_fields={"reason": f"Queued by {APPROVER_NAME} as part of parallel group {task_id}"}, # Added reason
                                 approver_name=APPROVER_NAME)
                         else:
                             print(f"[{APPROVER_NAME}] Child task {child_id} for parallel group {task_id} is not in PLANNED state, skipping queueing.")
 
-                elif current_task_type_db == TASK_TYPE_SEQUENTIAL_GROUP: # Using constant
+                elif current_task_type_db == TASK_TYPE_SEQUENTIAL_GROUP:
                     first_child_to_queue_id = None
                     for child_id_in_order in child_task_ids:
-                        child_doc = db.tasks.find_one({"_id": child_id_in_order})
+                        child_doc = db.tasks.find_one({"_id": child_id_in_order}) # Use _id
                         if child_doc and child_doc.get("groupId") == task_id and \
                            (child_doc.get("previousTaskId") is None or child_doc.get("previousTaskId") == ""):
                             first_child_to_queue_id = child_id_in_order
                             break
                     
                     if first_child_to_queue_id:
-                        child_doc = db.tasks.find_one({"_id": first_child_to_queue_id})
-                        if child_doc and child_doc.get("state") == STATE_PLANNED: # Only queue if planned (Using constant)
+                        child_doc = db.tasks.find_one({"_id": first_child_to_queue_id}) # Use _id
+                        if child_doc and child_doc.get("state") == STATE_PLANNED:
                             print(f"[{APPROVER_NAME}] Queuing first child {first_child_to_queue_id} for sequential group {task_id}.")
-                            update_entity_state_in_mongodb(db, "tasks", first_child_to_queue_id, STATE_QUEUED, old_state_condition=STATE_PLANNED, # Using constants
-                                additional_fields={"reason": f"Queued by {APPROVER_NAME} as first child of sequential group {task_id}"},
+                            update_entity_state_in_mongodb(db, "tasks", first_child_to_queue_id, STATE_QUEUED, old_state_condition=STATE_PLANNED,
+                                additional_fields={"reason": f"Queued by {APPROVER_NAME} as first child of sequential group {task_id}"}, # Added reason
                                 approver_name=APPROVER_NAME)
                         elif child_doc and child_doc.get("state") in get_terminal_states():
                              print(f"[{APPROVER_NAME}] First child {first_child_to_queue_id} for sequential group {task_id} is already in state {child_doc.get('state')}. Checking group completion.")
@@ -518,19 +536,19 @@ def reflow_kafka_task_executor_dag_v4():
                             print(f"[{APPROVER_NAME}] First child {first_child_to_queue_id} for sequential group {task_id} is not in PLANNED state or already processed. State: {child_doc.get('state') if child_doc else 'N/A'}")
                     else:
                         print(f"[{APPROVER_NAME}] Warning: No initial child (previousTaskId=null or empty) found for sequential group {task_id}. Cannot initiate children.")
-                        update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"No initial child task found for sequential group. ({APPROVER_NAME})"}, # Using constant
+                        update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, additional_fields={"reason": f"No initial child task found for sequential group. ({APPROVER_NAME})"},
                             approver_name=APPROVER_NAME)
                 
                 # Group task remains IN_PROGRESS until its children trigger its completion.
                 return
 
             # --- Handle TRIGGER Task Type ---
-            elif current_task_type_db == TASK_TYPE_TRIGGER: # Using constant
+            elif current_task_type_db == TASK_TYPE_TRIGGER:
                 trigger_interval = current_task_doc.get("triggerInterval")
                 if not isinstance(trigger_interval, (int, float)) or trigger_interval <= 0:
                     print(f"[{APPROVER_NAME}] ERROR: Task {task_id} of type TRIGGER has invalid or missing 'triggerInterval'. Marking FAILED.")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, # Using constant
-                        additional_fields={"reason": f"TRIGGER task has invalid triggerInterval. ({APPROVER_NAME})"},
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                        additional_fields={"reason": f"TRIGGER task has invalid triggerInterval. ({APPROVER_NAME})"}, # Added reason
                         approver_name=APPROVER_NAME)
                     raise AirflowFailException(f"TRIGGER task {task_id} has invalid triggerInterval.")
 
@@ -553,13 +571,18 @@ def reflow_kafka_task_executor_dag_v4():
                 _append_task_logs_in_mongodb(db, task_id, combined_output_trigger)
 
                 if process.returncode != 0:
-                    print(f"[{APPROVER_NAME}] JAR execution failed for TRIGGER task {task_id} with exit code {process.returncode}. Stderr: {process.stderr}")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"JAR execution for TRIGGER task failed: {process.stderr.strip()} ({APPROVER_NAME})"}, # Using constant
+                    error_message = f"JAR execution failed for TRIGGER task {task_id} with exit code {process.returncode}. Stderr: {process.stderr.strip()}"
+                    print(f"[{APPROVER_NAME}] {error_message}")
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                        additional_fields={"reason": f"JAR execution for TRIGGER task failed: {error_message} ({APPROVER_NAME})"},
                         approver_name=APPROVER_NAME)
                     raise AirflowFailException(f"JAR execution failed for TRIGGER task {task_id}")
+                else:
+                    print(f"[{APPROVER_NAME}] JAR execution for TRIGGER task {task_id} reported success.")
+
 
                 # Re-fetch task state after JAR execution to see if it completed or failed
-                current_task_doc_after_jar_run = db.tasks.find_one({"_id": task_id})
+                current_task_doc_after_jar_run = db.tasks.find_one({"_id": task_id}) # Use _id
                 if not current_task_doc_after_jar_run:
                     raise AirflowFailException(f"[{APPROVER_NAME}] Task {task_id} not found in MongoDB after JAR run for TRIGGER type.")
                 
@@ -577,7 +600,7 @@ def reflow_kafka_task_executor_dag_v4():
                 return 
 
             # --- Handle Regular Tasks ---
-            elif current_task_type_db == TASK_TYPE_REGULAR: # Using constant
+            elif current_task_type_db == TASK_TYPE_REGULAR:
                 
                 print(f"[{APPROVER_NAME}] Executing JAR: {JAR_FILE_PATH} for task_id: {task_id} with Actor: {actor}. Expected to complete synchronously.")
                 command = [
@@ -598,47 +621,49 @@ def reflow_kafka_task_executor_dag_v4():
                 _append_task_logs_in_mongodb(db, task_id, combined_output_sync)
 
                 if process.returncode != 0:
-                    print(f"[{APPROVER_NAME}] JAR execution for {task_id} reported failure (exit code {process.returncode}).")
-                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"JAR execution failed: {process.stderr.strip()} ({APPROVER_NAME})"}, # Using constant
+                    error_message = f"JAR execution for {task_id} reported failure (exit code {process.returncode}). Stderr: {process.stderr.strip()}"
+                    print(f"[{APPROVER_NAME}] {error_message}")
+                    update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                        additional_fields={"reason": f"JAR execution failed: {error_message} ({APPROVER_NAME})"},
                         approver_name=APPROVER_NAME)
                     raise AirflowFailException(f"JAR execution failed for {task_id}")
                 else:
                     print(f"[{APPROVER_NAME}] JAR execution for {task_id} reported success.")
-                    updated_task_doc = db.tasks.find_one({"_id": task_id}) # Re-fetch to get latest
+                    updated_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id, Re-fetch to get latest
                     if not updated_task_doc:
                         raise AirflowFailException(f"[{APPROVER_NAME}] Task {task_id} not found in MongoDB after JAR completion.")
 
                     # After synchronous JAR execution, ensure task is in a terminal state.
                     if updated_task_doc.get("state") not in get_terminal_states():
                         print(f"[{APPROVER_NAME}] Warning: JAR for task {task_id} exited successfully, but task state in DB is still '{updated_task_doc.get('state')}'. Expected a terminal state. Setting to COMPLETED by DAG.")
-                        update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED, # Using constant
-                            additional_fields={"reason": f"JAR exited successfully but task state not terminal. Marked COMPLETED by DAG."},
+                        update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED,
+                            additional_fields={"reason": f"JAR exited successfully but task state not terminal. Marked COMPLETED by DAG. ({APPROVER_NAME})"},
                             approver_name=APPROVER_NAME)
-                        updated_task_doc = db.tasks.find_one({"_id": task_id}) # Re-fetch to get truly updated state
+                        updated_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id, Re-fetch to get truly updated state
 
 
                 # --- Post-completion logic for synchronous tasks: queue next task in flow ---
-                if updated_task_doc.get("state") == STATE_COMPLETED: # Using constant
+                if updated_task_doc.get("state") == STATE_COMPLETED:
                     if updated_task_doc.get("nextTaskId"):
                         _queue_next_task_after_completion(db, updated_task_doc)
 
-                elif updated_task_doc.get("state") == STATE_FAILED and updated_task_doc.get("nextTaskId"): # Using constant
+                elif updated_task_doc.get("state") == STATE_FAILED and updated_task_doc.get("nextTaskId"):
                     print(f"[{APPROVER_NAME}] Task {task_id} FAILED. Not queuing next task {updated_task_doc.get('nextTaskId')}.")
                 
                 # --- Group Parent Logic (if current task is a child of a group) ---
                 if updated_task_doc.get("groupId"):
                     group_id = updated_task_doc.get("groupId")
-                    parent_group_task = db.tasks.find_one({"_id": group_id, "type": {"$in": [TASK_TYPE_PARALLEL_GROUP, TASK_TYPE_SEQUENTIAL_GROUP]}}) # Using constants
+                    parent_group_task = db.tasks.find_one({"_id": group_id, "type": {"$in": [TASK_TYPE_PARALLEL_GROUP, TASK_TYPE_SEQUENTIAL_GROUP]}}) # Use _id
                     if parent_group_task:
                         print(f"[{APPROVER_NAME}] Task {task_id} is part of group {group_id}. Checking group completion and sequential flow.")
                         
-                        if parent_group_task.get("type") == TASK_TYPE_SEQUENTIAL_GROUP and updated_task_doc.get("state") == STATE_COMPLETED: # Using constant
+                        if parent_group_task.get("type") == TASK_TYPE_SEQUENTIAL_GROUP and updated_task_doc.get("state") == STATE_COMPLETED:
                             # Find the next child in the sequence
                             next_child_in_seq = db.tasks.find_one({"groupId": group_id, "previousTaskId": task_id})
                             if next_child_in_seq:
                                 print(f"[{APPROVER_NAME}] Sequential group {group_id}: Queuing next child task {next_child_in_seq.get('_id')}.")
-                                update_entity_state_in_mongodb(db, "tasks", next_child_in_seq.get("_id"), STATE_QUEUED, old_state_condition=STATE_PLANNED, # Using constants
-                                    additional_fields={"reason": f"Queued by {APPROVER_NAME} as next in sequential group {group_id}"},
+                                update_entity_state_in_mongodb(db, "tasks", next_child_in_seq.get("_id"), STATE_QUEUED, old_state_condition=STATE_PLANNED,
+                                    additional_fields={"reason": f"Queued by {APPROVER_NAME} as next in sequential group {group_id}"}, # Added reason
                                     approver_name=APPROVER_NAME)
                             else:
                                 print(f"[{APPROVER_NAME}] Sequential group {group_id}: No further child found after {task_id}.")
@@ -655,11 +680,11 @@ def reflow_kafka_task_executor_dag_v4():
                         
                         if all_group_children_terminal:
                             print(f"[{APPROVER_NAME}] All children of group {group_id} are terminal. Marking group as COMPLETED.")
-                            update_entity_state_in_mongodb(db, "tasks", group_id, STATE_COMPLETED, old_state_condition=STATE_IN_PROGRESS, # Using constants
-                                additional_fields={"reason": f"Group task completed as all children are terminal. ({APPROVER_NAME})"},
+                            update_entity_state_in_mongodb(db, "tasks", group_id, STATE_COMPLETED, old_state_condition=STATE_IN_PROGRESS,
+                                additional_fields={"reason": f"Group task completed as all children are terminal. ({APPROVER_NAME})"}, # Added reason
                                 approver_name=APPROVER_NAME)
                             # IMPORTANT: After the group task itself is completed, queue its own nextTaskId
-                            updated_group_task_doc = db.tasks.find_one({"_id": group_id}) # Re-fetch to get latest state
+                            updated_group_task_doc = db.tasks.find_one({"_id": group_id}) # Use _id, Re-fetch to get latest state
                             if updated_group_task_doc and updated_group_task_doc.get("nextTaskId"):
                                 _queue_next_task_after_completion(db, updated_group_task_doc)
                             _check_and_transition_parent_states(db, group_id, parent_group_task.get("phaseId"), parent_group_task.get("groupId"))
@@ -671,14 +696,14 @@ def reflow_kafka_task_executor_dag_v4():
                     _check_and_transition_parent_states(db, task_id, phase_id, None)
             
             # --- SCHEDULER task type is handled by reflow_scheduler_monitor_dag.py
-            elif current_task_type_db == TASK_TYPE_SCHEDULER: # Using constant
+            elif current_task_type_db == TASK_TYPE_SCHEDULER:
                 print(f"[{APPROVER_NAME}] SCHEDULER task {task_id} (name: {task_name}) is QUEUED. Marking as COMPLETED.")
-                update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED, old_state_condition=STATE_IN_PROGRESS, # Using constant
-                    additional_fields={"reason": f"SCHEDULER task time reached and processed by DAG. ({APPROVER_NAME})"},
+                update_entity_state_in_mongodb(db, "tasks", task_id, STATE_COMPLETED, old_state_condition=STATE_IN_PROGRESS,
+                    additional_fields={"reason": f"SCHEDULER task time reached and processed by DAG. ({APPROVER_NAME})"}, # Added reason
                     approver_name=APPROVER_NAME)
                 
                 # After SCHEDULER task completes, queue next task if any
-                updated_task_doc = db.tasks.find_one({"_id": task_id}) # Re-fetch to get updated state
+                updated_task_doc = db.tasks.find_one({"_id": task_id}) # Use _id, Re-fetch to get updated state
                 if updated_task_doc and updated_task_doc.get("nextTaskId"):
                     _queue_next_task_after_completion(db, updated_task_doc)
                 else:
@@ -694,23 +719,31 @@ def reflow_kafka_task_executor_dag_v4():
             # Re-raise to defer the task
             raise e
         except (ConnectionFailure, OperationFailure) as e:
-            print(f"[{APPROVER_NAME}] MongoDB connection/operation failed for task {task_id}: {e}")
-            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"MongoDB interaction failed: {e} ({APPROVER_NAME})"}, # Using constant
+            error_message = f"MongoDB connection/operation failed for task {task_id}: {e}"
+            print(f"[{APPROVER_NAME}] {error_message}")
+            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                additional_fields={"reason": f"MongoDB interaction failed: {error_message} ({APPROVER_NAME})"},
                 approver_name=APPROVER_NAME)
             raise AirflowFailException(f"[{APPROVER_NAME}] Task execution failed for {task_id} due to MongoDB error: {e}")
         except subprocess.CalledProcessError as e:
-            print(f"[{APPROVER_NAME}] JAR execution failed for task {task_id} with exit code {e.returncode}. Stderr: {e.stderr}")
-            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"JAR execution failed: {e.stderr} ({APPROVER_NAME})"}, # Using constant
+            error_message = f"JAR execution failed for task {task_id} with exit code {e.returncode}. Stderr: {e.stderr.strip()}"
+            print(f"[{APPROVER_NAME}] {error_message}")
+            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                additional_fields={"reason": f"JAR execution failed: {error_message} ({APPROVER_NAME})"},
                 approver_name=APPROVER_NAME)
             raise AirflowFailException(f"JAR execution failed for {task_id}")
-        except FileNotFoundError:
-            print(f"[{APPROVER_NAME}] Error: JAR file not found at {JAR_FILE_PATH} or Java executable not found.")
-            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"JAR file or Java executable not found: {JAR_FILE_PATH} ({APPROVER_NAME})"}, # Using constant
+        except FileNotFoundError as e:
+            error_message = f"JAR file not found at {JAR_FILE_PATH} or Java executable not found: {e}"
+            print(f"[{APPROVER_NAME}] Error: {error_message}")
+            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                additional_fields={"reason": f"JAR file or Java executable not found: {error_message} ({APPROVER_NAME})"},
                 approver_name=APPROVER_NAME)
             raise AirflowFailException(f"JAR file or Java executable not found.")
         except Exception as e:
-            print(f"[{APPROVER_NAME}] Unexpected error during task {task_id} execution: {e}")
-            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED, {"reason": f"Unexpected error: {e} ({APPROVER_NAME})"}, # Using constant
+            error_message = f"Unexpected error during task {task_id} execution: {e}"
+            print(f"[{APPROVER_NAME}] {error_message}")
+            update_entity_state_in_mongodb(db, "tasks", task_id, STATE_FAILED,
+                additional_fields={"reason": f"Unexpected error: {error_message} ({APPROVER_NAME})"},
                 approver_name=APPROVER_NAME)
             raise AirflowFailException(f"Unexpected error for {task_id}: {e}")
         finally:
@@ -727,7 +760,7 @@ def reflow_kafka_task_executor_dag_v4():
         if not next_task_id:
             return
 
-        next_task_doc = db.tasks.find_one({"_id": next_task_id})
+        next_task_doc = db.tasks.find_one({"_id": next_task_id}) # Use _id
         if not next_task_doc:
             print(f"[{APPROVER_NAME}] Warning: Completed task {completed_task_doc.get('_id')} has nextTaskId {next_task_id} but it's not found.")
             return
@@ -739,17 +772,17 @@ def reflow_kafka_task_executor_dag_v4():
         # If next task is PLANNED, queue it.
         # If next task is a gate and its gateStatus is APPROVED, queue it immediately.
         # Otherwise, the flow waits.
-        if next_task_state == STATE_PLANNED: # Using constant
+        if next_task_state == STATE_PLANNED:
             print(f"[{APPROVER_NAME}] Task {completed_task_doc.get('_id')} completed. Queuing next task: {next_task_id}.")
-            update_entity_state_in_mongodb(db, "tasks", next_task_id, STATE_QUEUED, old_state_condition=STATE_PLANNED, # Using constants
-                additional_fields={"reason": f"Queued by {APPROVER_NAME} after completion of {completed_task_doc.get('_id')}"},
+            update_entity_state_in_mongodb(db, "tasks", next_task_id, STATE_QUEUED, old_state_condition=STATE_PLANNED,
+                additional_fields={"reason": f"Queued by {APPROVER_NAME} after completion of {completed_task_doc.get('_id')}"}, # Added reason
                 approver_name=APPROVER_NAME)
-        elif next_task_is_gate and next_gate_status == GATE_STATUS_APPROVED: # Using constant
+        elif next_task_is_gate and next_gate_status == GATE_STATUS_APPROVED:
             print(f"[{APPROVER_NAME}] Task {completed_task_doc.get('_id')} completed. Next task {next_task_id} is an APPROVED gate. Queuing it...")
-            update_entity_state_in_mongodb(db, "tasks", next_task_id, STATE_QUEUED, old_state_condition=STATE_PLANNED, # It would be PLANNED if not yet touched (Using constant)
-                additional_fields={"reason": f"Queued by {APPROVER_NAME} after completion of {completed_task_doc.get('_id')} (next is approved gate)"},
+            update_entity_state_in_mongodb(db, "tasks", next_task_id, STATE_QUEUED, old_state_condition=STATE_PLANNED,
+                additional_fields={"reason": f"Queued by {APPROVER_NAME} after completion of {completed_task_doc.get('_id')} (next is approved gate)"}, # Added reason
                 approver_name=APPROVER_NAME)
-        elif next_task_is_gate and next_gate_status == GATE_STATUS_REJECTED: # Using constant
+        elif next_task_is_gate and next_gate_status == GATE_STATUS_REJECTED:
             print(f"[{APPROVER_NAME}] Task {completed_task_doc.get('_id')} completed. Next task {next_task_id} is a REJECTED gate. Stopping workflow progression.")
             # Do not queue next task; the flow stops here.
             # The FAILED gate will be picked up by the main consumer to mark its parent as terminal.
@@ -777,17 +810,68 @@ def reflow_kafka_task_executor_dag_v4():
 
             if all_phase_tasks_terminal:
                 print(f"[{APPROVER_NAME}] All tasks in phase {child_phase_id} are terminal. Marking phase as COMPLETED.")
-                update_entity_state_in_mongodb(db, "phases", child_phase_id, STATE_COMPLETED, # Using constant
-                    additional_fields={"reason": f"Phase completed as all tasks are terminal. ({APPROVER_NAME})"},
+                update_entity_state_in_mongodb(db, "phases", child_phase_id, STATE_COMPLETED,
+                    additional_fields={"reason": f"Phase completed as all tasks are terminal. ({APPROVER_NAME})"}, # Added reason
                     approver_name=APPROVER_NAME)
                 
+                # --- NEW LOGIC: Trigger next phase and its first task ---
+                current_phase_doc = db.phases.find_one({"_id": child_phase_id})
+                if current_phase_doc and current_phase_doc.get("nextPhaseId"):
+                    next_phase_id = current_phase_doc.get("nextPhaseId")
+                    next_phase_doc = db.phases.find_one({"_id": next_phase_id})
+                    
+                    if next_phase_doc:
+                        next_phase_state = next_phase_doc.get("state")
+                        if next_phase_state in [STATE_PLANNED, STATE_BLOCKED]:
+                            print(f"[{APPROVER_NAME}] Current phase {child_phase_id} completed. Transitioning next phase {next_phase_id} to IN_PROGRESS.")
+                            phase_transition_success = update_entity_state_in_mongodb(
+                                db, "phases", next_phase_id, STATE_IN_PROGRESS,
+                                old_state_condition=next_phase_state,
+                                additional_fields={"reason": f"Auto-transitioned by completion of previous phase {child_phase_id} by {APPROVER_NAME}"},
+                                approver_name=APPROVER_NAME
+                            )
+                            if phase_transition_success:
+                                # Find the first task of the next phase (no previousTaskId and no groupId)
+                                first_tasks_of_next_phase = db.tasks.find({
+                                    "phaseId": next_phase_id,
+                                    "previousTaskId": None,
+                                    "groupId": None
+                                }).sort("createdAt", 1).limit(1) # Sort by creation to get deterministic 'first'
+
+                                first_task_doc_list = list(first_tasks_of_next_phase) # Convert cursor to list
+                                if first_task_doc_list:
+                                    first_task_of_next_phase = first_task_doc_list[0]
+                                    first_task_state = first_task_of_next_phase.get("state")
+                                    if first_task_state in [STATE_PLANNED, STATE_BLOCKED]:
+                                        print(f"[{APPROVER_NAME}] Queuing first task {first_task_of_next_phase.get('_id')} of next phase {next_phase_id}.")
+                                        update_entity_state_in_mongodb(
+                                            db, "tasks", first_task_of_next_phase.get("_id"), STATE_QUEUED,
+                                            old_state_condition=first_task_state,
+                                            additional_fields={"reason": f"Auto-queued as first task of phase {next_phase_id} initiated by {APPROVER_NAME}"},
+                                            approver_name=APPROVER_NAME
+                                        )
+                                    else:
+                                        print(f"[{APPROVER_NAME}] First task {first_task_of_next_phase.get('_id')} of next phase {next_phase_id} is in state {first_task_state}, not queuing.")
+                                else:
+                                    print(f"[{APPROVER_NAME}] No direct starting task found for next phase {next_phase_id}.")
+                            else:
+                                print(f"[{APPROVER_NAME}] Failed to transition next phase {next_phase_id} to IN_PROGRESS (concurrent update?).")
+                        else:
+                            print(f"[{APPROVER_NAME}] Next phase {next_phase_id} is in state {next_phase_state}, not auto-transitioning.")
+                    else:
+                        print(f"[{APPROVER_NAME}] Next phase {next_phase_id} not found for phase {child_phase_id}.")
+                else:
+                    print(f"[{APPROVER_NAME}] Phase {child_phase_id} has no next phase configured.")
+
+
         # 2. Check Release Completion
         if child_phase_id:
             # Find parent release by checking phases that contain this child_phase_id
-            parent_release = db.releases.find_one({"phaseIds": child_phase_id})
+            # NOTE: MongoDB's find_one returns a dict, not a cursor. No need for .get("_id")
+            parent_release = db.releases.find_one({"phaseIds": child_phase_id}) 
             if parent_release:
                 # Fetch all phases for this parent release directly from DB
-                release_phases_cursor = db.phases.find({"parentId": parent_release.get("_id"), "parentType": "RELEASE"})
+                release_phases_cursor = db.phases.find({"parentId": parent_release.get("_id"), "parentType": "RELEASE"}) 
                 all_release_phases = list(release_phases_cursor)
                 
                 all_release_phases_terminal = True
@@ -798,8 +882,8 @@ def reflow_kafka_task_executor_dag_v4():
 
                 if all_release_phases_terminal:
                     print(f"[{APPROVER_NAME}] All phases in Release {parent_release.get('_id')} are terminal. Marking Release as COMPLETED.")
-                    update_entity_state_in_mongodb(db, "releases", parent_release.get("_id"), STATE_COMPLETED, # Using constant
-                        additional_fields={"reason": f"Release completed as all phases are terminal. ({APPROVER_NAME})"},
+                    update_entity_state_in_mongodb(db, "releases", parent_release.get("_id"), STATE_COMPLETED,
+                        additional_fields={"reason": f"Release completed as all phases are terminal. ({APPROVER_NAME})"}, # Added reason
                         approver_name=APPROVER_NAME)
                     
                     # 3. Check Release Group Completion
@@ -817,8 +901,8 @@ def reflow_kafka_task_executor_dag_v4():
 
                         if all_group_releases_terminal:
                             print(f"[{APPROVER_NAME}] All releases in Release Group {release_group_id} are terminal. Marking Release Group as COMPLETED.")
-                            update_entity_state_in_mongodb(db, "releaseGroups", release_group_id, STATE_COMPLETED, # Using constant
-                                additional_fields={"reason": f"Release Group completed as all releases are terminal. ({APPROVER_NAME})"},
+                            update_entity_state_in_mongodb(db, "releaseGroups", release_group_id, STATE_COMPLETED,
+                                additional_fields={"reason": f"Release Group completed as all releases are terminal. ({APPROVER_NAME})"}, # Added reason
                                 approver_name=APPROVER_NAME)
 
 
