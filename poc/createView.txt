@@ -1,0 +1,135 @@
+db.createView(
+   "releasePhaseTaskView",  // Name of the view
+   "releases",              // The collection to start the aggregation from
+   [
+      // Lookup phases associated with each release
+      {
+         $lookup: {
+            from: "phases",
+            let: { releaseId: "$_id" },
+            pipeline: [
+               {
+                  $match: {
+                     $expr: {
+                        $and: [
+                           { $eq: ["$parentId", "$$releaseId"] },
+                           { $eq: ["$parentType", "RELEASE"] }
+                        ]
+                     }
+                  }
+               },
+               // Sort phases by creation time or a logical order if available
+               { $sort: { createdAt: 1 } },
+               // Lookup tasks associated with each phase
+               {
+                  $lookup: {
+                     from: "tasks",
+                     let: { phaseId: "$_id" },
+                     pipeline: [
+                        {
+                           $match: {
+                              $expr: { $eq: ["$phaseId", "$$phaseId"] }
+                           }
+                        },
+                        // Sort tasks by previousTaskId for sequential order if applicable, or creation time
+                        // Note: For complex linked lists (previousTaskId/nextTaskId), in-app processing is easier.
+                        // Here, we'll sort by creation date as a fallback.
+                        { $sort: { createdAt: 1 } },
+                        // Add an optional lookup for child tasks within group tasks
+                        {
+                           $lookup: {
+                              from: "tasks", // Join with tasks collection again for children
+                              localField: "childTaskIds", // The field in the current (parent) task
+                              foreignField: "_id",        // The field in the joined (child) task
+                              as: "childrenTasks"         // Name of the array field to add
+                           }
+                        },
+                         // Project to refine task fields and ensure childrenTasks are properly nested
+                        {
+                           $project: {
+                              _id: 1,
+                              id: "$_id", // Map _id to id for consistency with DTOs
+                              name: 1,
+                              description: 1,
+                              type: 1,
+                              state: 1,
+                              previousTaskId: 1,
+                              nextTaskId: 1,
+                              groupId: 1,
+                              childTaskIds: 1,
+                              scheduledTime: 1,
+                              approvers: 1,
+                              approvedBy: 1,
+                              approvalDate: 1,
+                              reason: 1,
+                              isGate: 1,
+                              gateStatus: 1,
+                              actor: 1,
+                              taskVariables: 1,
+                              logs: 1,
+                              triggerInterval: 1,
+                              inputVariables: 1,
+                              outputVariables: 1,
+                              createdAt: 1,
+                              updatedAt: 1,
+                              version: 1,
+                              // Recursively apply populateChildrenTasks logic if needed,
+                              // but this is complex in a single view. For simple nested children:
+                              childrenTasks: {
+                                 $map: {
+                                    input: "$childrenTasks",
+                                    as: "childTask",
+                                    in: {
+                                       _id: "$$childTask._id",
+                                       id: "$$childTask._id",
+                                       name: "$$childTask.name",
+                                       type: "$$childTask.type",
+                                       state: "$$childTask.state"
+                                       // Only include essential fields for nested children to avoid deep recursion in view
+                                    }
+                                 }
+                              }
+                           }
+                        }
+                     ],
+                     as: "tasks" // Array of tasks for each phase
+                  }
+               },
+               // Project to refine phase fields
+               {
+                  $project: {
+                     _id: 1,
+                     id: "$_id", // Map _id to id
+                     parentType: 1,
+                     parentId: 1,
+                     name: 1,
+                     description: 1,
+                     state: 1,
+                     createdAt: 1,
+                     updatedAt: 1,
+                     version: 1,
+                     tasks: 1 // Include the populated tasks
+                  }
+               }
+            ],
+            as: "phases" // Array of phases for each release
+         }
+      },
+      // Project to refine release fields and include populated phases
+      {
+         $project: {
+            _id: 1,
+            id: "$_id", // Map _id to id
+            releaseGroupId: 1,
+            name: 1,
+            description: 1,
+            state: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            version: 1,
+            phases: 1 // Include the populated phases
+         }
+      }
+   ]
+)
+```
