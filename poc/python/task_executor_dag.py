@@ -95,10 +95,10 @@ def _append_task_logs_in_mongodb(db, task_id, new_log_content):
     timestamp = pendulum.now("UTC").isoformat()
     log_entry = f"\n--- Log Entry [{timestamp}] ---\n{new_log_content}"
 
-    # Use $concat to append string. $set is also included for updatedAt.
+    # Use aggregation pipeline with $set and $concat to atomically append to logs field
     result = db.tasks.update_one(
         {"_id": task_id},
-        {"$set": {"updatedAt": timestamp}, "$concat": {"logs": log_entry}}
+        [{"$set": {"logs": {"$concat": ["$logs", log_entry]}, "updatedAt": timestamp}}]
     )
     if result.modified_count == 0:
         print(f"[{APPROVER_NAME}] Warning: Task {task_id} not found or logs not appended.")
