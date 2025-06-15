@@ -76,8 +76,11 @@ public class ReleaseGroupController {
             for (Release release : childReleases) {
                 ReleaseFullDto releaseFullDto = new ReleaseFullDto(release);
                 
-                // Fetch Phases for this Release
+                // Fetch Phases for this Release (ordered by previous/next if possible)
                 List<Phase> releasePhases = phaseRepository.findByParentIdAndParentType(release.getId(), Phase.ParentType.RELEASE);
+                // Sort phases by their linked list order
+                releasePhases = sortPhasesByLinkedList(releasePhases);
+
                 List<PhaseFullDto> phaseFullDtos = new ArrayList<>();
 
                 for (Phase phase : releasePhases) {
@@ -87,10 +90,11 @@ public class ReleaseGroupController {
                     // We need to ensure that the order of tasks from the phase's taskIds is maintained
                     List<TaskDto> taskDtos = new ArrayList<>();
                     if (phase.getTaskIds() != null) {
-                        for (String taskId : phase.getTaskIds()) {
-                            taskRepository.findById(taskId).ifPresent(task ->
-                                taskDtos.add(populateChildrenTasks(task, taskRepository)) // Recursively map and add in order
-                            );
+                        List<Task> rawTasks = taskRepository.findAllById(phase.getTaskIds());
+                        rawTasks = sortTasksByLinkedList(rawTasks); // Sort tasks by linked list order
+
+                        for (Task task : rawTasks) {
+                            taskDtos.add(populateChildrenTasks(task, taskRepository)); // Recursively map and add in order
                         }
                     }
                     phaseFullDto.setTasks(taskDtos);
@@ -105,6 +109,9 @@ public class ReleaseGroupController {
         // 2. Fetch direct child Phases (those directly under the ReleaseGroup) and their nested tasks
         if (releaseGroup.getPhaseIds() != null && !releaseGroup.getPhaseIds().isEmpty()) {
             List<Phase> directPhases = phaseRepository.findAllById(releaseGroup.getPhaseIds());
+            // Sort phases by their linked list order
+            directPhases = sortPhasesByLinkedList(directPhases);
+
             List<PhaseFullDto> directPhaseFullDtos = new ArrayList<>();
 
             for (Phase phase : directPhases) {
@@ -113,10 +120,10 @@ public class ReleaseGroupController {
                 // Fetch Tasks for this direct Phase and recursively populate children
                 List<TaskDto> taskDtos = new ArrayList<>();
                 if (phase.getTaskIds() != null) {
-                    for (String taskId : phase.getTaskIds()) {
-                        taskRepository.findById(taskId).ifPresent(task ->
-                            taskDtos.add(populateChildrenTasks(task, taskRepository)) // Recursively map and add in order
-                        );
+                    List<Task> rawTasks = taskRepository.findAllById(phase.getTaskIds());
+                    rawTasks = sortTasksByLinkedList(rawTasks); // Sort tasks by linked list order
+                    for (Task task : rawTasks) {
+                        taskDtos.add(populateChildrenTasks(task, taskRepository)); // Recursively map and add in order
                     }
                 }
                 phaseFullDto.setTasks(taskDtos);
@@ -136,17 +143,101 @@ public class ReleaseGroupController {
             // Now directly access childTaskIds from the Task entity
             List<String> childTaskIds = task.getChildTaskIds();
             if (childTaskIds != null && !childTaskIds.isEmpty()) {
+                List<Task> rawChildren = taskRepository.findAllById(childTaskIds);
                 List<TaskDto> childrenDtos = new ArrayList<>();
-                for (String childId : childTaskIds) {
-                    taskRepository.findById(childId).ifPresent(childTask ->
-                        childrenDtos.add(populateChildrenTasks(childTask, taskRepository)) // Recursive call, adding in order
-                    );
+
+                // If it's a SEQUENTIAL_GROUP, sort children by linked list
+                if (task.getType() == Task.TaskType.SEQUENTIAL_GROUP) {
+                    rawChildren = sortTasksByLinkedList(rawChildren);
+                }
+                // For PARALLEL_GROUP, order doesn't strictly matter for execution, but maintain consistent view
+                // if there's no previous/next set on parallel children, just use existing order or natural ID sort.
+
+                for (Task childTask : rawChildren) {
+                    childrenDtos.add(populateChildrenTasks(childTask, taskRepository)); // Recursive call
                 }
                 taskDto.setChildrenTasks(childrenDtos);
             }
         }
         return taskDto;
     }
+
+    // Helper to sort a list of tasks based on previousTaskId/nextTaskId
+    private List<Task> sortTasksByLinkedList(List<Task> tasks) {
+        if (tasks == null || tasks.size() <= 1) {
+            return tasks;
+        }
+
+        List<Task> sortedTasks = new ArrayList<>();
+        // Find the starting task (one with no previousTaskId in the given list)
+        Task currentTask = tasks.stream()
+                                .filter(t -> t.getPreviousTaskId() == null || tasks.stream().noneMatch(other -> other.getId().equals(t.getPreviousTaskId())))
+                                .findFirst()
+                                .orElse(null);
+
+        // If no explicit start, pick the first one and try to build from there
+        if (currentTask == null) {
+            currentTask = tasks.get(0); // Fallback
+        }
+
+        int safetyCounter = 0;
+        final int maxIterations = tasks.size() * 2; // Prevent infinite loops for bad links
+
+        while (currentTask != null && !sortedTasks.contains(currentTask) && safetyCounter < maxIterations) {
+            sortedTasks.add(currentTask);
+            String nextId = currentTask.getNextTaskId();
+            currentTask = tasks.stream().filter(t -> t.getId().equals(nextId)).findFirst().orElse(null);
+            safetyCounter++;
+        }
+
+        // Add any tasks not found in the sequence (e.g., if there are broken links or multiple starting points)
+        // This ensures all tasks are returned, even if the linking is imperfect.
+        for (Task task : tasks) {
+            if (!sortedTasks.contains(task)) {
+                sortedTasks.add(task);
+            }
+        }
+
+        return sortedTasks;
+    }
+
+    // Helper to sort a list of phases based on previousPhaseId/nextPhaseId
+    private List<Phase> sortPhasesByLinkedList(List<Phase> phases) {
+        if (phases == null || phases.size() <= 1) {
+            return phases;
+        }
+
+        List<Phase> sortedPhases = new ArrayList<>();
+        // Find the starting phase (one with no previousPhaseId in the given list)
+        Phase currentPhase = phases.stream()
+                                .filter(p -> p.getPreviousPhaseId() == null || phases.stream().noneMatch(other -> other.getId().equals(p.getPreviousPhaseId())))
+                                .findFirst()
+                                .orElse(null);
+
+        if (currentPhase == null) {
+            currentPhase = phases.get(0); // Fallback if no clear start
+        }
+
+        int safetyCounter = 0;
+        final int maxIterations = phases.size() * 2; // Prevent infinite loops
+
+        while (currentPhase != null && !sortedPhases.contains(currentPhase) && safetyCounter < maxIterations) {
+            sortedPhases.add(currentPhase);
+            String nextId = currentPhase.getNextPhaseId();
+            currentPhase = phases.stream().filter(p -> p.getId().equals(nextId)).findFirst().orElse(null);
+            safetyCounter++;
+        }
+
+        // Add any phases not found in the sequence
+        for (Phase phase : phases) {
+            if (!sortedPhases.contains(phase)) {
+                sortedPhases.add(phase);
+            }
+        }
+
+        return sortedPhases;
+    }
+
 
     @PutMapping("/{id}")
     public ResponseEntity<ReleaseGroup> updateReleaseGroup(@PathVariable String id, @RequestBody ReleaseGroup releaseGroupDetails) {
@@ -263,6 +354,8 @@ public class ReleaseController {
         // Fetch Phases for this Release
         if (release.getPhaseIds() != null && !release.getPhaseIds().isEmpty()) {
             List<Phase> releasePhases = phaseRepository.findAllById(release.getPhaseIds());
+            releasePhases = sortPhasesByLinkedList(releasePhases); // Sort phases by linked list order
+
             List<PhaseFullDto> phaseFullDtos = new ArrayList<>();
 
             for (Phase phase : releasePhases) {
@@ -272,10 +365,11 @@ public class ReleaseController {
                 // We need to ensure that the order of tasks from the phase's taskIds is maintained
                 List<TaskDto> taskDtos = new ArrayList<>();
                 if (phase.getTaskIds() != null) {
-                    for (String taskId : phase.getTaskIds()) {
-                        taskRepository.findById(taskId).ifPresent(task ->
-                            taskDtos.add(populateChildrenTasks(task, taskRepository)) // Recursively map and add in order
-                        );
+                    List<Task> rawTasks = taskRepository.findAllById(phase.getTaskIds());
+                    rawTasks = sortTasksByLinkedList(rawTasks); // Sort tasks by linked list order
+
+                    for (Task task : rawTasks) {
+                        taskDtos.add(populateChildrenTasks(task, taskRepository)); // Recursively map and add in order
                     }
                 }
                 phaseFullDto.setTasks(taskDtos);
@@ -295,11 +389,18 @@ public class ReleaseController {
             // Now directly access childTaskIds from the Task entity
             List<String> childTaskIds = task.getChildTaskIds();
             if (childTaskIds != null && !childTaskIds.isEmpty()) {
+                List<Task> rawChildren = taskRepository.findAllById(childTaskIds);
                 List<TaskDto> childrenDtos = new ArrayList<>();
-                for (String childId : childTaskIds) {
-                    taskRepository.findById(childId).ifPresent(childTask ->
-                        childrenDtos.add(populateChildrenTasks(childTask, taskRepository)) // Recursive call, adding in order
-                    );
+
+                // If it's a SEQUENTIAL_GROUP, sort children by linked list
+                if (task.getType() == Task.TaskType.SEQUENTIAL_GROUP) {
+                    rawChildren = sortTasksByLinkedList(rawChildren);
+                }
+                // For PARALLEL_GROUP, order doesn't strictly matter for execution, but maintain consistent view
+                // if there's no previous/next set on parallel children, just use existing order or natural ID sort.
+
+                for (Task childTask : rawChildren) {
+                    childrenDtos.add(populateChildrenTasks(childTask, taskRepository)); // Recursive call
                 }
                 taskDto.setChildrenTasks(childrenDtos);
             }
@@ -307,6 +408,78 @@ public class ReleaseController {
         return taskDto;
     }
 
+    // Helper to sort a list of tasks based on previousTaskId/nextTaskId
+    private List<Task> sortTasksByLinkedList(List<Task> tasks) {
+        if (tasks == null || tasks.size() <= 1) {
+            return tasks;
+        }
+
+        List<Task> sortedTasks = new ArrayList<>();
+        // Find the starting task (one with no previousTaskId in the given list)
+        Task currentTask = tasks.stream()
+                                .filter(t -> t.getPreviousTaskId() == null || tasks.stream().noneMatch(other -> other.getId().equals(t.getPreviousTaskId())))
+                                .findFirst()
+                                .orElse(null);
+
+        if (currentTask == null) {
+            currentTask = tasks.get(0); // Fallback
+        }
+
+        int safetyCounter = 0;
+        final int maxIterations = tasks.size() * 2; // Prevent infinite loops for bad links
+
+        while (currentTask != null && !sortedTasks.contains(currentTask) && safetyCounter < maxIterations) {
+            sortedTasks.add(currentTask);
+            String nextId = currentTask.getNextTaskId();
+            currentTask = tasks.stream().filter(t -> t.getId().equals(nextId)).findFirst().orElse(null);
+            safetyCounter++;
+        }
+        // Add any tasks not found in the sequence (e.g., if there are broken links or multiple starting points)
+        for (Task task : tasks) {
+            if (!sortedTasks.contains(task)) {
+                sortedTasks.add(task);
+            }
+        }
+
+        return sortedTasks;
+    }
+
+    // Helper to sort a list of phases based on previousPhaseId/nextPhaseId
+    private List<Phase> sortPhasesByLinkedList(List<Phase> phases) {
+        if (phases == null || phases.size() <= 1) {
+            return phases;
+        }
+
+        List<Phase> sortedPhases = new ArrayList<>();
+        // Find the starting phase (one with no previousPhaseId in the given list)
+        Phase currentPhase = phases.stream()
+                                .filter(p -> p.getPreviousPhaseId() == null || phases.stream().noneMatch(other -> other.getId().equals(p.getPreviousPhaseId())))
+                                .findFirst()
+                                .orElse(null);
+
+        if (currentPhase == null) {
+            currentPhase = phases.get(0); // Fallback if no clear start
+        }
+
+        int safetyCounter = 0;
+        final int maxIterations = phases.size() * 2; // Prevent infinite loops
+
+        while (currentPhase != null && !sortedPhases.contains(currentPhase) && safetyCounter < maxIterations) {
+            sortedPhases.add(currentPhase);
+            String nextId = currentPhase.getNextPhaseId();
+            currentPhase = phases.stream().filter(p -> p.getId().equals(nextId)).findFirst().orElse(null);
+            safetyCounter++;
+        }
+
+        // Add any phases not found in the sequence
+        for (Phase phase : phases) {
+            if (!sortedPhases.contains(phase)) {
+                sortedPhases.add(phase);
+            }
+        }
+
+        return sortedPhases;
+    }
 
     @PutMapping("/{id}")
     public ResponseEntity<Release> updateRelease(@PathVariable String id, @RequestBody Release releaseDetails) {
@@ -381,7 +554,11 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.util.ArrayList; // NEW: for sorting
 import java.util.List;
+import java.util.Map; // NEW: for sorting
+import java.util.Comparator; // NEW: for sorting
+import java.util.stream.Collectors; // NEW: for sorting
 
 @RestController
 @RequestMapping("/api/phases")
@@ -410,6 +587,7 @@ public class PhaseController {
         List<Phase> phases;
         if (parentId != null && !parentId.trim().isEmpty() && parentType != null) {
             phases = phaseRepository.findByParentIdAndParentType(parentId, parentType);
+            phases = sortPhasesByLinkedList(phases); // Sort phases for consistent order
         } else {
             phases = phaseRepository.findAll();
         }
@@ -433,17 +611,64 @@ public class PhaseController {
         if (phaseDetails.getState() != null && !phaseDetails.getState().trim().isEmpty()) {
             phase.setState(phaseDetails.getState());
         }
+        // Allow updating previousPhaseId and nextPhaseId via PUT, but creation service should manage linking
+        phase.setPreviousPhaseId(phaseDetails.getPreviousPhaseId());
+        phase.setNextPhaseId(phaseDetails.getNextPhaseId());
+
         Phase updatedPhase = phaseRepository.save(phase);
         return ResponseEntity.ok(updatedPhase);
     }
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deletePhase(@PathVariable String id) {
+        // TODO: Implement proper deletion logic that also updates previous/next links
         if (!phaseRepository.existsById(id)) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Phase not found with ID: " + id);
         }
         phaseRepository.deleteById(id);
         return new ResponseEntity<>(HttpStatus.NO_CONTENT);
+    }
+
+    // Helper to sort a list of phases based on previousPhaseId/nextPhaseId (duplicated from ReleaseController)
+    // In a larger app, this would be a shared utility.
+    private List<Phase> sortPhasesByLinkedList(List<Phase> phases) {
+        if (phases == null || phases.size() <= 1) {
+            return phases;
+        }
+
+        List<Phase> sortedPhases = new ArrayList<>();
+        // Find the starting phase (one with no previousPhaseId in the given list)
+        Phase currentPhase = phases.stream()
+                                .filter(p -> p.getPreviousPhaseId() == null || phases.stream().noneMatch(other -> other.getId().equals(p.getPreviousPhaseId())))
+                                .findFirst()
+                                .orElse(null);
+
+        if (currentPhase == null) {
+            // Fallback: If no clear start, find the one that is NOT a 'next' of any other phase in the list
+            currentPhase = phases.stream()
+                .filter(p -> phases.stream().noneMatch(other -> p.getId().equals(other.getNextPhaseId())))
+                .findFirst()
+                .orElse(phases.get(0)); // Last resort, just pick the first
+        }
+
+        int safetyCounter = 0;
+        final int maxIterations = phases.size() * 2; // Prevent infinite loops
+
+        while (currentPhase != null && !sortedPhases.contains(currentPhase) && safetyCounter < maxIterations) {
+            sortedPhases.add(currentPhase);
+            String nextId = currentPhase.getNextPhaseId();
+            currentPhase = phases.stream().filter(p -> p.getId().equals(nextId)).findFirst().orElse(null);
+            safetyCounter++;
+        }
+
+        // Add any phases not found in the sequence (e.g., if there are broken links or multiple starting points)
+        for (Phase phase : phases) {
+            if (!sortedPhases.contains(phase)) {
+                sortedPhases.add(phase);
+            }
+        }
+
+        return sortedPhases;
     }
 }
 
