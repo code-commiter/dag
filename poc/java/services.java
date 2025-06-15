@@ -222,7 +222,11 @@ public class PhaseCreationService {
             ReleaseGroup parentReleaseGroup = releaseGroupRepository.findById(phase.getParentId())
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Parent Release Group not found with ID: " + phase.getParentId()));
             
-            phase.setId(idGenerator.generateId("P", phase.getParentId())); // Generate ID
+            phase.setId(idGenerator.generateId("P", phase.getParentId())); // Generate ID for the new phase
+            
+            // Handle phase linking (previousPhaseId/nextPhaseId)
+            linkNewPhase(phase, parentReleaseGroup.getId(), phase.getParentType());
+
             Phase savedPhase = phaseRepository.save(phase); // Save the new Phase
 
             // Add child Phase ID to parent ReleaseGroup's phaseIds list
@@ -234,7 +238,11 @@ public class PhaseCreationService {
             Release parentRelease = releaseRepository.findById(phase.getParentId())
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Parent Release not found with ID: " + phase.getParentId()));
             
-            phase.setId(idGenerator.generateId("P", phase.getParentId())); // Generate ID
+            phase.setId(idGenerator.generateId("P", phase.getParentId())); // Generate ID for the new phase
+            
+            // Handle phase linking (previousPhaseId/nextPhaseId)
+            linkNewPhase(phase, parentRelease.getId(), phase.getParentType());
+
             Phase savedPhase = phaseRepository.save(phase); // Save the new Phase
 
             parentRelease.getPhaseIds().add(savedPhase.getId()); // Add child ID to parent's list
@@ -244,7 +252,104 @@ public class PhaseCreationService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid parentType. Must be RELEASE_GROUP or RELEASE.");
         }
     }
+
+    /**
+     * Helper method to manage `previousPhaseId` and `nextPhaseId` linking for a newly created phase.
+     * This logic determines where the new phase fits in the sequence of phases for its parent.
+     *
+     * @param newPhase The new Phase object being created.
+     * @param parentId The ID of the parent (ReleaseGroup or Release).
+     * @param parentType The type of the parent.
+     */
+    private void linkNewPhase(Phase newPhase, String parentId, Phase.ParentType parentType) {
+        String requestedPreviousPhaseId = newPhase.getPreviousPhaseId();
+        String requestedNextPhaseId = newPhase.getNextPhaseId();
+
+        // Scenario 1: New phase is explicitly placed after a specific previous phase
+        if (requestedPreviousPhaseId != null && !requestedPreviousPhaseId.trim().isEmpty()) {
+            Phase previousPhase = phaseRepository.findById(requestedPreviousPhaseId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Previous Phase not found with ID: " + requestedPreviousPhaseId));
+
+            // Ensure previous phase is under the same parent
+            if (!previousPhase.getParentId().equals(parentId) || !previousPhase.getParentType().equals(parentType)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Previous phase must belong to the same parent.");
+            }
+
+            String oldNextPhaseIdOfPrevious = previousPhase.getNextPhaseId();
+
+            // Link new phase
+            newPhase.setPreviousPhaseId(previousPhase.getId());
+            newPhase.setNextPhaseId(oldNextPhaseIdOfPrevious);
+
+            // Update previous phase's next link
+            previousPhase.setNextPhaseId(newPhase.getId());
+            phaseRepository.save(previousPhase);
+
+            // Update old next phase's previous link if it exists
+            if (oldNextPhaseIdOfPrevious != null && !oldNextPhaseIdOfPrevious.trim().isEmpty()) {
+                phaseRepository.findById(oldNextPhaseIdOfPrevious).ifPresent(oldNextPhase -> {
+                    oldNextPhase.setPreviousPhaseId(newPhase.getId());
+                    phaseRepository.save(oldNextPhase);
+                });
+            }
+        }
+        // Scenario 2: New phase is explicitly placed before a specific next phase (less common, but handled)
+        else if (requestedNextPhaseId != null && !requestedNextPhaseId.trim().isEmpty()) {
+             Phase nextPhase = phaseRepository.findById(requestedNextPhaseId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Next Phase not found with ID: " + requestedNextPhaseId));
+
+            // Ensure next phase is under the same parent
+            if (!nextPhase.getParentId().equals(parentId) || !nextPhase.getParentType().equals(parentType)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Next phase must belong to the same parent.");
+            }
+
+            String oldPreviousPhaseIdOfNext = nextPhase.getPreviousPhaseId();
+
+            // Link new phase
+            newPhase.setPreviousPhaseId(oldPreviousPhaseIdOfNext);
+            newPhase.setNextPhaseId(nextPhase.getId());
+
+            // Update next phase's previous link
+            nextPhase.setPreviousPhaseId(newPhase.getId());
+            phaseRepository.save(nextPhase);
+
+            // Update old previous phase's next link if it exists
+            if (oldPreviousPhaseIdOfNext != null && !oldPreviousPhaseIdOfNext.trim().isEmpty()) {
+                phaseRepository.findById(oldPreviousPhaseIdOfNext).ifPresent(oldPreviousPhase -> {
+                    oldPreviousPhase.setNextPhaseId(newPhase.getId());
+                    phaseRepository.save(oldPreviousPhase);
+                });
+            }
+        }
+        // Scenario 3: New phase is the first phase for this parent, or simply appended to the end.
+        // If neither previousPhaseId nor nextPhaseId are provided, try to auto-append.
+        else {
+            // Find the current last phase for this parent (a phase whose nextPhaseId is null)
+            Optional<Phase> currentLastPhaseOpt = phaseRepository.findByParentIdAndParentType(parentId, parentType)
+                                                                 .stream()
+                                                                 .filter(p -> p.getNextPhaseId() == null || p.getNextPhaseId().trim().isEmpty())
+                                                                 .findFirst(); // Assumes only one last phase
+
+            if (currentLastPhaseOpt.isPresent()) {
+                Phase currentLastPhase = currentLastPhaseOpt.get();
+                // Append the new phase to the end of the existing sequence
+                newPhase.setPreviousPhaseId(currentLastPhase.getId());
+                newPhase.setNextPhaseId(null); // It's the new last phase
+
+                currentLastPhase.setNextPhaseId(newPhase.getId());
+                phaseRepository.save(currentLastPhase);
+            } else {
+                // No existing phases with nextPhaseId null, meaning it's either an empty list
+                // or a fully linked list. If empty, this new phase is the first.
+                // If it's a fully linked list, this implies a potential error or intent to create a new head.
+                // For now, if no last phase found, assume it's the very first phase for this parent.
+                newPhase.setPreviousPhaseId(null);
+                newPhase.setNextPhaseId(null);
+            }
+        }
+    }
 }
+
 
 // src/main/java/com/reflow/services/TaskCreationService.java
 package com.reflow.services;
@@ -308,8 +413,7 @@ public class TaskCreationService {
         // If this task is intended to be a starting task (no previous task)
         if (task.getPreviousTaskId() == null || task.getPreviousTaskId().trim().isEmpty()) {
             List<Task> existingStartingTasks = null;
-            Task existingStartingTask = null;
-
+            
             // Determine the scope of the starting task check (phase or sequential group)
             if (task.getGroupId() == null || task.getGroupId().trim().isEmpty()) {
                 // Task is a direct child of a Phase (not part of an explicit group task)
@@ -328,16 +432,16 @@ public class TaskCreationService {
 
             if (existingStartingTasks != null && !existingStartingTasks.isEmpty()) {
                 // Found an existing starting task. We need to prepend the new task.
-                existingStartingTask = existingStartingTasks.get(0); // Get the current first task
+                Task currentFirstTask = existingStartingTasks.get(0); // Get the current first task
 
                 // Update the existing starting task to link to the new task
-                existingStartingTask.setPreviousTaskId(task.getId());
-                taskRepository.save(existingStartingTask);
+                currentFirstTask.setPreviousTaskId(task.getId());
+                taskRepository.save(currentFirstTask);
                 
                 // Set the new task's nextTaskId to the old starting task's ID
-                task.setNextTaskId(existingStartingTask.getId());
+                task.setNextTaskId(currentFirstTask.getId());
                 // The new task's previousTaskId remains null, making it the new start.
-                System.out.println("Info: New task " + task.getId() + " is now the starting task. Old starting task " + existingStartingTask.getId() + " linked as its next task.");
+                System.out.println("Info: New task " + task.getId() + " is now the starting task. Old starting task " + currentFirstTask.getId() + " linked as its next task.");
             }
         }
 
