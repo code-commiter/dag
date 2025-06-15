@@ -1,0 +1,603 @@
+// --- reflow_db.releaseGroups Collection ---
+[
+  {
+    "_id": "RG_web_app_suite_1",
+    "name": "Web Application Suite Release Group",
+    "description": "Manages releases for the entire web application ecosystem.",
+    "state": "IN_PROGRESS",
+    "releaseIds": [
+      "R_web_app_v1_0"
+    ],
+    "phaseIds": [
+      "P_rg_app_approval"
+    ],
+    "releaseContextId": "RG_web_app_suite_1",
+    "createdAt": ISODate("2025-06-14T09:00:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:00:00Z"),
+    "version": 3
+  }
+]
+
+// --- reflow_db.releases Collection ---
+[
+  {
+    "_id": "R_web_app_v1_0",
+    "releaseGroupId": "RG_web_app_suite_1",
+    "name": "Web App v1.0 Production Release",
+    "description": "Deployment and testing for Web App version 1.0.",
+    "state": "IN_PROGRESS",
+    "phaseIds": [
+      "P_dev_deploy_v1_0",
+      "P_qa_test_v1_0",
+      "P_automation_gates"
+    ],
+    "releaseContextId": "R_web_app_v1_0",
+    "createdAt": ISODate("2025-06-14T09:05:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:05:00Z"),
+    "version": 4
+  }
+]
+
+// --- reflow_db.phases Collection ---
+[
+  {
+    "_id": "P_rg_app_approval",
+    "parentType": "RELEASE_GROUP",
+    "parentId": "RG_web_app_suite_1",
+    "name": "Suite-wide Dev Approvals",
+    "description": "Phase for cross-release group development sign-offs.",
+    "state": "IN_PROGRESS",
+    "taskIds": [
+      "T_rg_dev_appr_gate_1"
+    ],
+    "createdAt": ISODate("2025-06-14T09:10:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:10:00Z"),
+    "version": 2
+  },
+  {
+    "_id": "P_dev_deploy_v1_0",
+    "parentType": "RELEASE",
+    "parentId": "R_web_app_v1_0",
+    "name": "Development Deployment",
+    "description": "Steps to deploy to the DEV environment.",
+    "state": "IN_PROGRESS",
+    "taskIds": [
+      "T_dev_pre_deploy_1",
+      "T_dev_deploy_app_1",
+      "T_dev_validate_deploy_1"
+    ],
+    "createdAt": ISODate("2025-06-14T09:15:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:15:00Z"),
+    "version": 3
+  },
+  {
+    "_id": "P_qa_test_v1_0",
+    "parentType": "RELEASE",
+    "parentId": "R_web_app_v1_0",
+    "name": "QA Testing",
+    "description": "Automated and manual QA tests for the release.",
+    "state": "PLANNED",
+    "taskIds": [
+      "T_qa_run_e2e_1",
+      "T_qa_compliance_gate_1"
+    ],
+    "createdAt": ISODate("2025-06-14T09:20:00Z"),
+    "updatedAt": ISODate("2025-06-14T09:20:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "P_automation_gates",
+    "parentType": "RELEASE",
+    "parentId": "R_web_app_v1_0",
+    "name": "Automation & Post-Deployment Gates",
+    "description": "Contains parallel and sequential automated tasks and their gates.",
+    "state": "IN_PROGRESS",
+    "taskIds": [
+      "T_deploy_parallel_group",
+      "T_deploy_frontend_service",
+      "T_deploy_backend_service",
+      "T_post_deploy_seq_group",
+      "T_run_smoke_tests",
+      "T_data_integrity_check",
+      "T_security_scan"
+    ],
+    "createdAt": ISODate("2025-06-14T17:00:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:20:00Z"),
+    "version": 1
+  }
+]
+
+// --- reflow_db.tasks Collection ---
+[
+  {
+    "_id": "T_rg_dev_appr_gate_1",
+    "phaseId": "P_rg_app_approval",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Dev Lead Release Group Approval",
+    "description": "Manual approval from Dev Lead for suite-wide readiness.",
+    "type": "APPROVAL",
+    "state": "WAITING_FOR_APPROVAL",
+    "previousTaskId": null,
+    "nextTaskId": null,
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": ["dev_lead_user_id"],
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": true,
+    "gateStatus": null,
+    "gateCategory": "Development Readiness",
+    "actor": "RELEASE_MANAGER",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {},
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T09:25:00Z"),
+    "updatedAt": ISODate("2025-06-14T09:25:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_dev_pre_deploy_1",
+    "phaseId": "P_dev_deploy_v1_0",
+    "releaseId": "R_web_app_v1_0",
+    "name": "DEV Pre-deploy Restart Services",
+    "description": "Restarting web servers and databases before deployment in DEV.",
+    "type": "REGULAR",
+    "state": "COMPLETED",
+    "previousTaskId": null,
+    "nextTaskId": "T_dev_deploy_app_1",
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "DEPLOYMENT_SYSTEM",
+    "taskVariables": {
+      "restart_log": "Services restarted successfully. Uptime checks passed."
+    },
+    "logs": "--- Log Entry [2025-06-14T10:04:30.123Z] ---\nSTDOUT:\nService orchestration script executed.\nDEV services successfully restarted.\nSTDERR:\n",
+    "inputVariables": {
+      "environment": "DEV",
+      "services": ["web-server", "database"]
+    },
+    "outputVariables": {
+      "status": "success",
+      "uptime_check": "passed"
+    },
+    "createdAt": ISODate("2025-06-14T09:30:00Z"),
+    "updatedAt": ISODate("2025-06-14T10:05:00Z"),
+    "version": 2
+  },
+  {
+    "_id": "T_dev_deploy_app_1",
+    "phaseId": "P_dev_deploy_v1_0",
+    "releaseId": "R_web_app_v1_0",
+    "name": "DEV Deploy Application Artifacts",
+    "description": "Downloads and deploys application artifacts to DEV servers.",
+    "type": "REGULAR",
+    "state": "IN_PROGRESS",
+    "previousTaskId": "T_dev_pre_deploy_1",
+    "nextTaskId": "T_dev_validate_deploy_1",
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "DEPLOYMENT_SYSTEM",
+    "taskVariables": {
+      "tower_job_id": "ansible_job_789012345",
+      "last_api_poll_time": "2025-06-14T18:18:30.000Z",
+      "monitoring_active": true,
+      "current_tower_status": "running"
+    },
+    "logs": "--- Log Entry [2025-06-14T10:06:15.000Z] ---\nSTDOUT:\nDeployment initiated. Job ID: ansible_job_789012345\nSTDERR:\n\n--- Log Entry [2025-06-14T18:18:30.000Z] ---\nSTDOUT (CALLBACK):\nKafka check: No status update received yet for job ansible_job_789012345.\nSTDERR (CALLBACK):\n\n--- Log Entry [2025-06-14T18:19:00.000Z] ---\nSTDOUT (POLL):\nHTTP Poll: Job ansible_job_789012345 status is still 'running'.\nSTDERR (POLL):\n",
+    "inputVariables": {
+      "environment": "DEV",
+      "artifact_name": "web-app-v1.0",
+      "artifact_version": "1.0.0"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T10:06:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:19:00Z"),
+    "version": 4
+  },
+  {
+    "_id": "T_dev_validate_deploy_1",
+    "phaseId": "P_dev_deploy_v1_0",
+    "releaseId": "R_web_app_v1_0",
+    "name": "DEV Post-deploy Validation",
+    "description": "Verifies service health after DEV deployment.",
+    "type": "REGULAR",
+    "state": "PLANNED",
+    "previousTaskId": "T_dev_deploy_app_1",
+    "nextTaskId": null,
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "VALIDATION_SERVICE",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {
+      "environment": "DEV",
+      "validation_checks": ["service_health", "api_endpoints"]
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T10:10:00Z"),
+    "updatedAt": ISODate("2025-06-14T10:10:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_qa_run_e2e_1",
+    "phaseId": "P_qa_test_v1_0",
+    "releaseId": "R_web_app_v1_0",
+    "name": "QA Run E2E Tests",
+    "description": "Executes automated End-to-End test suite in QA.",
+    "type": "REGULAR",
+    "state": "PLANNED",
+    "previousTaskId": null,
+    "nextTaskId": "T_qa_compliance_gate_1",
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "TEST_AUTOMATION",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {
+      "environment": "QA",
+      "test_suite_id": "e2e_suite_v1"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T09:40:00Z"),
+    "updatedAt": ISODate("2025-06-14T09:40:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_qa_compliance_gate_1",
+    "phaseId": "P_qa_test_v1_0",
+    "releaseId": "R_web_app_v1_0",
+    "name": "QA Compliance Check",
+    "description": "Automated compliance check against security policies.",
+    "type": "REGULAR",
+    "state": "PLANNED",
+    "previousTaskId": "T_qa_run_e2e_1",
+    "nextTaskId": null,
+    "groupId": null,
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": true,
+    "gateStatus": null,
+    "gateCategory": "Security Compliance",
+    "actor": "COMPLIANCE_ENGINE",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {
+      "compliance_profile": "HIPAA_2025"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T09:45:00Z"),
+    "updatedAt": ISODate("2025-06-14T09:45:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_deploy_parallel_group",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Parallel Microservice Deployment",
+    "description": "Deploys frontend and backend services concurrently.",
+    "type": "PARALLEL_GROUP",
+    "state": "IN_PROGRESS",
+    "previousTaskId": null,
+    "nextTaskId": "T_post_deploy_seq_group",
+    "groupId": null,
+    "childTaskIds": ["T_deploy_frontend_service", "T_deploy_backend_service"],
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "ORCHESTRATOR",
+    "taskVariables": {
+      "completionStatus": {
+        "T_deploy_frontend_service": "QUEUED",
+        "T_deploy_backend_service": "QUEUED"
+      }
+    },
+    "logs": "--- Log Entry [2025-06-14T18:21:00.000Z] ---\nSTDOUT:\nInitiating parallel deployment group. Queuing children tasks.\nSTDERR:\n",
+    "inputVariables": {
+      "services_to_deploy": ["frontend", "backend"]
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:20:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:21:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_deploy_frontend_service",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Deploy Frontend Service",
+    "description": "Deploys the web application frontend service.",
+    "type": "REGULAR",
+    "state": "QUEUED",
+    "previousTaskId": null,
+    "nextTaskId": null,
+    "groupId": "T_deploy_parallel_group",
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "DEPLOYMENT_SYSTEM",
+    "taskVariables": {
+      "tower_job_id": "ansible_job_frontend_123",
+      "last_api_poll_time": "2025-06-14T18:21:05.000Z"
+    },
+    "logs": "--- Log Entry [2025-06-14T18:21:00.000Z] ---\nSTDOUT (SYNC):\nQueued by SYSTEM as part of parallel group T_deploy_parallel_group.\nSTDERR:\n",
+    "inputVariables": {
+      "service_name": "frontend",
+      "image_tag": "v1.0.0-frontend"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:20:10Z"),
+    "updatedAt": ISODate("2025-06-14T18:21:05Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_deploy_backend_service",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Deploy Backend Service",
+    "description": "Deploys the web application backend service.",
+    "type": "REGULAR",
+    "state": "QUEUED",
+    "previousTaskId": null,
+    "nextTaskId": null,
+    "groupId": "T_deploy_parallel_group",
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "DEPLOYMENT_SYSTEM",
+    "taskVariables": {
+      "tower_job_id": "ansible_job_backend_456",
+      "last_api_poll_time": "2025-06-14T18:21:05.000Z"
+    },
+    "logs": "--- Log Entry [2025-06-14T18:21:00.000Z] ---\nSTDOUT (SYNC):\nQueued by SYSTEM as part of parallel group T_deploy_parallel_group.\nSTDERR:\n",
+    "inputVariables": {
+      "service_name": "backend",
+      "image_tag": "v1.0.0-backend"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:20:20Z"),
+    "updatedAt": ISODate("2025-06-14T18:21:05Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_post_deploy_seq_group",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Post-Deployment Validations",
+    "description": "Runs smoke tests, data integrity, and security scans sequentially.",
+    "type": "SEQUENTIAL_GROUP",
+    "state": "IN_PROGRESS",
+    "previousTaskId": "T_deploy_parallel_group",
+    "nextTaskId": null,
+    "groupId": null,
+    "childTaskIds": ["T_run_smoke_tests", "T_data_integrity_check", "T_security_scan"],
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "ORCHESTRATOR",
+    "taskVariables": {
+      "currentSequentialChild": "T_run_smoke_tests",
+      "completionStatus": {}
+    },
+    "logs": "--- Log Entry [2025-06-14T18:22:00.000Z] ---\nSTDOUT:\nInitiating sequential post-deployment validation group. Queuing first child.\nSTDERR:\n",
+    "inputVariables": {
+      "validation_suite": "post-deploy-critical"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:21:30Z"),
+    "updatedAt": ISODate("2025-06-14T18:22:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_run_smoke_tests",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Run Smoke Tests",
+    "description": "Executes critical smoke tests on deployed services.",
+    "type": "REGULAR",
+    "state": "QUEUED",
+    "previousTaskId": null,
+    "nextTaskId": "T_data_integrity_check",
+    "groupId": "T_post_deploy_seq_group",
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "TEST_AUTOMATION",
+    "taskVariables": {
+      "test_suite": "smoke_tests",
+      "results_url": "http://testresults.com/smoke/123"
+    },
+    "logs": "--- Log Entry [2025-06-14T18:22:00.000Z] ---\nSTDOUT (SYNC):\nQueued by SYSTEM as first child of sequential group T_post_deploy_seq_group.\nSTDERR:\n",
+    "inputVariables": {
+      "target_environment": "QA",
+      "suite_name": "critical_smoke_tests"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:21:40Z"),
+    "updatedAt": ISODate("2025-06-14T18:22:00Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_data_integrity_check",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Perform Data Integrity Check",
+    "description": "Verifies data consistency after deployment.",
+    "type": "REGULAR",
+    "state": "PLANNED",
+    "previousTaskId": "T_run_smoke_tests",
+    "nextTaskId": "T_security_scan",
+    "groupId": "T_post_deploy_seq_group",
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "VALIDATION_SERVICE",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {
+      "database_connection": "prod_db_conn",
+      "table_list": ["users", "orders"]
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:21:50Z"),
+    "updatedAt": ISODate("2025-06-14T18:21:50Z"),
+    "version": 1
+  },
+  {
+    "_id": "T_security_scan",
+    "phaseId": "P_automation_gates",
+    "releaseId": "R_web_app_v1_0",
+    "name": "Run Post-Deploy Security Scan",
+    "description": "Initiates a security scan on the newly deployed environment.",
+    "type": "REGULAR",
+    "state": "PLANNED",
+    "previousTaskId": "T_data_integrity_check",
+    "nextTaskId": null,
+    "groupId": "T_post_deploy_seq_group",
+    "childTaskIds": null,
+    "scheduledTime": null,
+    "approvers": null,
+    "approvedBy": null,
+    "approvalDate": null,
+    "reason": null,
+    "isGate": false,
+    "gateStatus": null,
+    "actor": "SECURITY_ENGINE",
+    "taskVariables": {},
+    "logs": "",
+    "inputVariables": {
+      "scan_profile": "critical_vulnerabilities",
+      "target_url": "https://prod.myapp.com"
+    },
+    "outputVariables": {},
+    "createdAt": ISODate("2025-06-14T18:22:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:22:00Z"),
+    "version": 1
+  }
+]
+
+// --- reflow_db.releaseContexts Collection ---
+[
+  {
+    "_id": "RG_web_app_suite_1",
+    "entityType": "RELEASE_GROUP",
+    "globalShared": {
+      "overallSuiteStatus": "green",
+      "suiteWideSecurityScanPassed": true,
+      "lastCompliancePolicyVersion": "1.2.0"
+    },
+    "environments": {},
+    "childReleaseContextIds": [
+      "R_web_app_v1_0"
+    ],
+    "createdAt": ISODate("2025-06-14T09:00:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:00:00Z"),
+    "version": 3
+  },
+  {
+    "_id": "R_web_app_v1_0",
+    "entityType": "RELEASE",
+    "globalShared": {
+      "artifactVersion": "1.0.0",
+      "artifactChecksum": "md5-abcdef12345",
+      "towerTemplateValidationCache": {
+        "templateId_456": {
+          "status": "VALIDATED",
+          "timestamp": ISODate("2025-06-14T09:35:00Z")
+        }
+      }
+    },
+    "environments": {
+      "DEV": {
+        "status": "deployed",
+        "baseUrl": "http://dev.myapp.com",
+        "credentials": {
+          "user": "devuser",
+          "pass": "devpass_encrypted"
+        },
+        "preDeployRestartStatus": "completed",
+        "deploymentStatus": "in_progress",
+        "currentDeployedVersion": "0.9.0",
+        "lastDeployTimestamp": ISODate("2025-06-14T10:07:00Z")
+      },
+      "QA": {
+        "status": "pending_deployment",
+        "baseUrl": "http://qa.myapp.com",
+        "credentials": {
+          "user": "qauser",
+          "pass": "qapass_encrypted"
+        },
+        "testResults": {
+          "e2e": "not_started",
+          "securityScan": "not_started"
+        }
+      }
+    },
+    "childReleaseContextIds": [],
+    "createdAt": ISODate("2025-06-14T09:05:00Z"),
+    "updatedAt": ISODate("2025-06-14T18:05:00Z"),
+    "version": 4
+  }
+]
