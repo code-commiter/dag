@@ -1,43 +1,17 @@
-// src/main/java/com/reflow/models/AllModels.java
+// src/main/java/com/reflow/models/BaseEntity.java
 package com.reflow.models;
 
-import lombok.AllArgsConstructor;
 import lombok.Data;
-import lombok.EqualsAndHashCode;
-import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.CreatedDate;
-import org.springframework.data.annotation.Id;
 import org.springframework.data.annotation.LastModifiedDate;
 import org.springframework.data.annotation.Version;
-import org.springframework.data.mongodb.core.mapping.Document;
 import org.springframework.data.mongodb.core.mapping.Field;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-// Enum for all possible states across different entities
-enum State {
-    PLANNED,
-    QUEUED,
-    IN_PROGRESS,
-    COMPLETED,
-    FAILED,
-    REJECTED,
-    BLOCKED,
-    WAITING_FOR_APPROVAL,
-    APPROVED,
-    SKIPPED,
-    SCHEDULED,
-    ARCHIVED,
-    RETRY
-}
 
 // BaseEntity for common fields across all documents
 @Data // Lombok annotation for getters, setters, toString, equals, hashCode
-abstract class BaseEntity {
+public abstract class BaseEntity {
 
     // Represents the current status of the object
     @Field("state")
@@ -56,13 +30,48 @@ abstract class BaseEntity {
     private Long version;
 }
 
-// ReleaseContext Model
+// src/main/java/com/reflow/models/State.java
+package com.reflow.models;
+
+// Enum for all possible states across different entities
+public enum State {
+    PLANNED,
+    QUEUED,
+    IN_PROGRESS,
+    COMPLETED,
+    FAILED,
+    REJECTED,
+    BLOCKED,
+    WAITING_FOR_APPROVAL,
+    APPROVED,
+    SKIPPED,
+    SCHEDULED,
+    ARCHIVED, // Added for completeness, for items that are 'done' and not active
+    RETRY // Added for completeness, for failed items that can be retried
+}
+
+// src/main/java/com/reflow/models/ReleaseContext.java
+package com.reflow.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.HashMap; // For initializing maps
+
 @Document(collection = "releaseContexts")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
-class ReleaseContext extends BaseEntity {
+public class ReleaseContext extends BaseEntity {
     @Id
     // The ID of the ReleaseContext will typically match the ID of the Release or ReleaseGroup it belongs to.
     private String id;
@@ -88,20 +97,34 @@ class ReleaseContext extends BaseEntity {
     private List<String> childReleaseContextIds = new ArrayList<>();
 
     // Enum for ContextEntityType
-    enum ContextEntityType {
+    public enum ContextEntityType {
         RELEASE_GROUP,
         RELEASE
     }
 }
 
 
-// ReleaseGroup Model
+// src/main/java/com/reflow/models/ReleaseGroup.java
+package com.reflow.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+import java.util.ArrayList;
+import java.util.List;
+
+// Defines the collection name in MongoDB
 @Document(collection = "releaseGroups")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true) // Include superclass fields in equals and hashCode
-class ReleaseGroup extends BaseEntity {
+public class ReleaseGroup extends BaseEntity {
     @Id // Marks this field as the document's primary key
     private String id;
     private String name;
@@ -117,13 +140,26 @@ class ReleaseGroup extends BaseEntity {
     private String releaseContextId; // Link to its ReleaseContext document
 }
 
-// Release Model
+// src/main/java/com/reflow/models/Release.java
+package com.reflow.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+import java.util.ArrayList;
+import java.util.List;
+
 @Document(collection = "releases")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
-class Release extends BaseEntity {
+public class Release extends BaseEntity {
     @Id
     private String id;
     @Field("releaseGroupId")
@@ -138,13 +174,26 @@ class Release extends BaseEntity {
     private String releaseContextId; // Link to its ReleaseContext document
 }
 
-// Phase Model
+// src/main/java/com/reflow/models/Phase.java
+package com.reflow.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+import java.util.ArrayList;
+import java.util.List;
+
 @Document(collection = "phases")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
-class Phase extends BaseEntity {
+public class Phase extends BaseEntity {
     @Id
     private String id;
     @Field("parentType")
@@ -153,25 +202,44 @@ class Phase extends BaseEntity {
     private String parentId; // Reference to the parent's actual ID (releaseGroupId or releaseId)
     private String name;
     private String description;
-    // isGate and gateStatus moved to Task.java as per new requirement
 
     @Field("taskIds")
     private List<String> taskIds = new ArrayList<>(); // List of child Task IDs
 
+    @Field("previousPhaseId")
+    private String previousPhaseId; // NEW: Link to the phase that precedes this one
+    @Field("nextPhaseId")
+    private String nextPhaseId;     // NEW: Link to the phase that follows this one
+
     // Enum for ParentType
-    enum ParentType {
+    public enum ParentType {
         RELEASE_GROUP,
         RELEASE
     }
 }
 
-// Task Model
+// src/main/java/com/reflow/models/Task.java
+package com.reflow.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map; // New import for Map
+import java.util.HashMap; // New import for HashMap
+
 @Document(collection = "tasks")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @EqualsAndHashCode(callSuper = true)
-class Task extends BaseEntity {
+public class Task extends BaseEntity {
     @Id
     private String id;
     @Field("phaseId")
@@ -220,19 +288,18 @@ class Task extends BaseEntity {
     private Map<String, Object> outputVariables = new HashMap<>(); // NEW: Output results from the task's execution
 
     // Enum for TaskType
-    enum TaskType {
-        REGULAR,
-        PARALLEL_GROUP,
-        SEQUENTIAL_GROUP,
+    public enum TaskType {
+        REGULAR, // Renamed from ATOMIC for clarity, equivalent to your 'atomic' in schema
+        PARALLEL_GROUP, // Renamed from 'group' with isParallel:true
+        SEQUENTIAL_GROUP, // Renamed from 'group' with isParallel:false
         APPROVAL,
         SCHEDULER,
-        TRIGGER
+        TRIGGER // NEW: For tasks that continuously trigger an external system
     }
 
-    // Enum for GateStatus
-    enum GateStatus {
-        PENDING, // Awaiting decision
-        APPROVED, // The gate has been approved
-        REJECTED // The gate has been rejected
+    // Enum for GateStatus (moved from Phase.java)
+    public enum GateStatus {
+        APPROVED,
+        REJECTED
     }
 }
