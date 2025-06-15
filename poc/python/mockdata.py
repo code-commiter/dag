@@ -63,7 +63,7 @@ def create_release(db, name, description, release_group_id=None, release_context
     print(f"  Created Release: {r_id} - '{name}' (Group: {release_group_id if release_group_id else 'None'})")
     return rel_doc
 
-def create_phase(db, name, description, parent_id, parent_type):
+def create_phase(db, name, description, parent_id, parent_type, previous_phase_id=None, next_phase_id=None):
     p_id = generate_id("P")
     phase_doc = {
         "_id": p_id,
@@ -73,6 +73,8 @@ def create_phase(db, name, description, parent_id, parent_type):
         "description": description,
         "state": "PLANNED",
         "taskIds": [], # To be populated with child tasks
+        "previousPhaseId": previous_phase_id, # NEW
+        "nextPhaseId": next_phase_id,         # NEW
         "createdAt": pendulum.now("UTC").isoformat(),
         "updatedAt": pendulum.now("UTC").isoformat(),
         "version": 1
@@ -367,11 +369,103 @@ def generate_all_data(db):
     print(f"Total Phases Created: {len(all_phase_ids)} - {all_phase_ids}")
     print(f"Total Tasks Created: {len(all_task_ids)} - {all_task_ids}")
 
+# --- New Simple Data Generation Logic ---
+def generate_simple_data(db):
+    print("\n--- Starting Simple Data Generation ---")
+
+    # Clear existing data for a clean run
+    print("\nClearing existing data...")
+    db.releaseGroups.delete_many({})
+    db.releases.delete_many({})
+    db.phases.delete_many({})
+    db.tasks.delete_many({})
+    db.releaseContexts.delete_many({})
+
+    all_release_ids = []
+    all_phase_ids = []
+    all_task_ids = []
+
+    # Create a single Release
+    simple_release_name = "Simple App Release v1.0"
+    simple_release_desc = "A basic release with sequential tasks across phases."
+    simple_release = create_release(db, simple_release_name, simple_release_desc, None, generate_id("RC_Simple"))
+    all_release_ids.append(simple_release["_id"])
+    
+    num_phases = 3
+    num_tasks_per_phase = 5
+
+    # Variable to keep track of the previously created phase ID for linking
+    previous_phase_id_in_sequence = None 
+
+    for i in range(1, num_phases + 1):
+        phase_name = f"Phase {i}"
+        phase_desc = f"Phase {i} for {simple_release_name}."
+        
+        # Pass previous_phase_id_in_sequence to create_phase for linking
+        phase = create_phase(db, phase_name, phase_desc, 
+                             simple_release["_id"], "RELEASE", 
+                             previous_phase_id=previous_phase_id_in_sequence)
+        
+        all_phase_ids.append(phase["_id"])
+        simple_release["phaseIds"].append(phase["_id"])
+        
+        # If there was a previous phase, update its nextPhaseId
+        if previous_phase_id_in_sequence:
+            db.phases.update_one(
+                {"_id": previous_phase_id_in_sequence},
+                {"$set": {"nextPhaseId": phase["_id"]}}
+            )
+        
+        # Update previous_phase_id_in_sequence for the next iteration
+        previous_phase_id_in_sequence = phase["_id"]
+
+        previous_task_id = None
+        current_phase_task_ids = []
+
+        for j in range(1, num_tasks_per_phase + 1):
+            task_name = f"Task {j} in {phase_name}"
+            task_desc = f"Regular task {j} for phase {phase_name}."
+            
+            task_props = {"actor": "DEVELOPER_BOT"}
+            if previous_task_id:
+                task_props["previousTaskId"] = previous_task_id
+
+            task = create_task(db, task_name, task_desc, "REGULAR", phase["_id"], simple_release["_id"], task_props)
+            all_task_ids.append(task["_id"])
+            current_phase_task_ids.append(task["_id"])
+
+            # Update the nextTaskId of the previous task to point to the current task
+            if previous_task_id:
+                db.tasks.update_one(
+                    {"_id": previous_task_id},
+                    {"$set": {"nextTaskId": task["_id"]}}
+                )
+            
+            previous_task_id = task["_id"] # Set current task as previous for the next iteration
+
+        # Update the phase document with all task IDs after creating them
+        db.phases.update_one({"_id": phase["_id"]}, {"$set": {"taskIds": current_phase_task_ids}})
+
+    # Update the release document with all phase IDs
+    db.releases.update_one({"_id": simple_release["_id"]}, {"$set": {"phaseIds": simple_release["phaseIds"]}})
+
+    print("\n--- Simple Data Generation Complete ---")
+    print(f"Created Release: {simple_release['_id']}")
+    print(f"Total Phases Created: {len(all_phase_ids)} - {all_phase_ids}")
+    print(f"Total Tasks Created: {len(all_task_ids)} - {all_task_ids}")
+
+
 if __name__ == "__main__":
     try:
         client = get_mongo_client()
         db = client[MONGO_DB_NAME]
-        generate_all_data(db)
+        
+        # Call the new simple data generation script
+        generate_simple_data(db)
+
+        # Comment out the original data generation
+        # generate_all_data(db) 
+
     except ConnectionFailure:
         print("Failed to connect to MongoDB. Please ensure MongoDB is running and accessible.")
     except Exception as e:
