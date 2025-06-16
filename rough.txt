@@ -1,0 +1,140 @@
+Reflow Workflow Project: Story Breakdown
+This document outlines the key user stories and development focus across six sprints for the Reflow Workflow project, emphasizing a phased approach to building out the orchestration capabilities.
+
+Sprint 1: Foundational Learning & Core Tooling Integration
+Sprint Goal: Establish a solid understanding of the core technologies and integrate essential development tools.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 1.1: As a developer, I want to learn basic Airflow workflow creation concepts so that I can prepare to create and manage data pipelines.
+
+Story 1.2: As a developer, I want to learn how to interact with MongoDB so that I can work with the database effectively.
+
+Spring Boot Java/MongoDB:
+
+Story 1.3: As a developer, I want to set up a basic Spring Boot project with a build tool so that I can begin developing the backend services.
+
+Story 1.4: As a developer, I want to integrate database connectivity into my Spring Boot project so that I can connect to and interact with MongoDB.
+
+Kafka/REST API Integration:
+
+Story 1.5: As a developer, I want to set up Kafka client tools so that I can connect to and interact with the message broker.
+
+Story 1.6: As a developer, I want to learn basic API communication concepts and how to use tools for testing API calls so that I can interact with web services.
+
+Sprint 2: Initial Entity Definition & Manual Operations
+Sprint Goal: Define core data entities, establish initial API endpoints, and practice manual data and message operations.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 2.1: As a developer, I want to manually create and run a simple "Hello World" workflow in Airflow so that I can verify basic workflow execution.
+
+Story 2.2: As a developer, I want to manually create initial categories (like top-level groups, releases, stages, and tasks) in MongoDB and populate them with sample data so that I have a starting dataset for testing.
+
+Spring Boot Java/MongoDB:
+
+Story 2.3: As a backend developer, I want to define how top-level groups and releases are structured in the database so that I can model the top-level hierarchy.
+
+Story 2.4: As a backend developer, I want to create basic ways to create, read, update, and delete top-level groups and releases through the API so that I can manage them via API calls.
+
+Kafka/REST API Integration:
+
+Story 2.5: As a developer, I want to manually send and receive messages to/from Kafka communication channels using the command-line interface so that I understand basic Kafka operations.
+
+Story 2.6: As a backend developer, I want to implement a generic way to manually change the status of any workflow item (top-level groups, releases, stages, or individual tasks) through the API so that status changes can be triggered from external systems.
+
+Sprint 3: Core Workflow Entities & Initial Orchestration
+Sprint Goal: Fully define the core workflow entities and establish basic orchestration where Airflow can read tasks from MongoDB.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 3.1: As an Airflow orchestrator, I want to create a workflow that connects to MongoDB and fetches tasks that are ready for processing so that I can begin executing them.
+
+Story 3.2: As an Airflow orchestrator, I want to understand task details like its unique identifier, name, and who is responsible for it so that I can prepare for task execution.
+
+Spring Boot Java/MongoDB:
+
+Story 3.3: As a backend developer, I want to define how stages and tasks are structured in the database, including how they relate to their parent items so that I can model the detailed workflow steps.
+
+Story 3.4: As a backend developer, I want to create ways to manage stages and tasks through the API so that I can update and retrieve their details.
+
+Kafka/REST API Integration:
+
+Story 3.5: As a backend developer, I want to build a service in the backend that can send events to Kafka so that the application can publish important updates.
+
+Story 3.6: As a backend developer, I want the status change API to send a general event to Kafka after successfully updating an item's status so that other services can react to these changes.
+
+Sprint 4: External Task Execution, Deployment JAR & Shared Context
+Sprint Goal: Enable Airflow to execute external programs for tasks, specifically focusing on a deployment JAR, and introduce a central shared context for dynamic data.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 4.1: As an Airflow orchestrator, I want the workflow to execute an external program for regular tasks, providing it with specific details and the overall release identifier so that automated actions, including deployments, can be triggered.
+
+Story 4.2: As an Airflow orchestrator, I want to capture all output and errors from the external program's execution and record them with the task so that I can debug execution issues.
+
+Spring Boot Java/MongoDB:
+
+Story 4.3: As a backend developer, I want to define a central place in the database to store dynamic, shared information for a release, including global data and environment-specific details so that tasks can access common data.
+
+Story 4.4: As a backend developer, I want to create a standalone executable program (e.g., a JAR) capable of interacting with an external deployment API to initiate and monitor deployments for specific environments, leveraging shared workflow data, so that automated and trackable deployments can occur.
+
+Kafka/REST API Integration:
+
+Story 4.5: As an external system, I want a specific Kafka channel to receive detailed updates about task status changes so that I can react to specific task lifecycle events.
+
+Story 4.6: As a backend developer, I want the status change API to send a specific message to Kafka with all relevant task information when a task's status changes so that the orchestration engine can reliably consume task updates.
+
+Sprint 5: Advanced Orchestration, Kafka Integration & Backend Logic
+Sprint Goal: Fully integrate Kafka event consumption into Airflow's orchestration flow, implement complex grouping logic, and enhance backend workflow management.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 5.1: As an Airflow orchestrator, I want the workflow to receive events from a specific Kafka channel for tasks that are ready to be processed so that it can react to real-time queuing of tasks.
+
+Story 5.2: As an Airflow orchestrator, I want to implement logic for tasks that group parallel or sequential actions, managing their sub-tasks efficiently so that complex multi-step workflows are executed correctly.
+
+Spring Boot Java/MongoDB:
+
+Story 5.3: As a backend developer, I want to build a service in the backend that can receive messages from general status change and specific task event channels on Kafka so that the backend can react to events published by other components.
+
+Story 5.4: As a backend service, I want to manage changes to the characteristics and relationships of workflow items, including their connections to other items, dynamic data, and historical records, so that the system accurately reflects the current state of the workflow.
+
+Kafka/REST API Integration:
+
+Story 5.5: As a system component, I want all task status updates, including those initiated by the orchestration engine, are sent as complete messages to Kafka so that other systems have a complete audit trail.
+
+Story 5.6: As a system, I want to ensure reliable sending and receiving of Kafka messages, with safeguards against loss so that message loss is minimized.
+
+Sprint 6: Specialized Task Types & Cascading Approvals
+Sprint Goal: Implement specialized task types and critical cascading approval logic to enhance workflow automation.
+
+User Stories:
+
+Airflow/MongoDB:
+
+Story 6.1: As an Airflow orchestrator, I want to implement a mechanism for tasks that continuously monitor external processes, re-checking their status at set intervals until they complete or fail so that long-running external processes can be overseen.
+
+Story 6.2: As an Airflow orchestrator, I want a separate orchestration process to monitor time-based tasks and activate them (move them to a ready state) when their scheduled time arrives so that time-based tasks are triggered automatically.
+
+Spring Boot Java/MongoDB:
+
+Story 6.3: As a backend developer, I want to implement logic to retrieve comprehensive workflow hierarchies (top-level groups with all their releases, stages, and tasks) through a single API call so that frontend applications can display full workflow views.
+
+Story 6.4: As a backend developer, I want to implement services to interact with and manage the shared workflow context, allowing updates and retrieval of global and environment-specific workflow data through dedicated API endpoints.
+
+Kafka/REST API Integration:
+
+Story 6.5: As an Airflow orchestrator, when a major decision point (like a top-level group approval) is finalized, an event is sent to automatically apply that approval or rejection to all related decision points in individual releases that share the same purpose so that higher-level decisions propagate.
+
+Story 6.6: As an Airflow orchestrator, I want a dedicated orchestration process to receive events for cascading approvals and directly update the status of affected decision points in the database to approved or rejected so that approvals cascade efficiently.
