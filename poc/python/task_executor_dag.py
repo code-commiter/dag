@@ -23,6 +23,7 @@ from datetime import timedelta
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowFailException, AirflowRescheduleException
 from airflow.models.param import Param # Keep Param import if you plan to add other parameters in the future, otherwise can remove it.
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # Import common utilities and configuration constants
 from reflow_dag_utils import (
@@ -143,7 +144,8 @@ def _append_task_logs_in_mongodb(db, task_id, new_log_content):
     synchronously. The JAR is expected to perform its action and complete,
     allowing the DAG to manage the task's state progression (`IN_PROGRESS` to `COMPLETED`/`FAILED`),
     chaining to the next task, and handling group task completion.
-    """
+    """,
+    max_active_runs=2 # Limit the number of concurrent DAG instances to 2
 )
 def reflow_kafka_task_executor_dag_v4():
 
@@ -910,6 +912,47 @@ def reflow_kafka_task_executor_dag_v4():
     queued_tasks_list = consume_and_filter_queued_tasks()
     execute_tasks = execute_and_transition_task.partial().expand(task_data=queued_tasks_list)
 
+
+    # 3. Task to proactively check for and trigger new DAG runs for queued tasks
+    @task
+    def check_and_trigger_newly_queued_tasks(**kwargs):
+        """
+        This task runs after all other tasks in the current DAG run have finished.
+        It simply checks for any QUEUED tasks in the database and, if found,
+        triggers a new DAG run to process them immediately.
+        """
+        mongo_client = None
+        try:
+            mongo_client = get_mongo_client(APPROVER_NAME)
+            db = mongo_client[MONGO_DB_NAME]
+
+            # Simply count how many tasks are in the QUEUED state
+            queued_task_count = db.tasks.count_documents({"state": STATE_QUEUED})
+            
+            if queued_task_count > 0:
+                print(f"[{APPROVER_NAME}] Found {queued_task_count} tasks in QUEUED state. Triggering a new DAG run.")
+                # Trigger a new DAG run without passing specific task_id in conf.
+                # The new DAG run's 'consume_and_filter_queued_tasks' will pick up all QUEUED tasks.
+                TriggerDagRunOperator(
+                    task_id='trigger_general_queue_check', # A generic task ID
+                    trigger_dag_id="reflow_kafka_task_executor_v4", # Trigger the same DAG
+                    conf={}, # No specific trigger_task_id, rely on the next run's general queue check
+                    wait_for_completion=False, # Don't wait for the triggered DAG to complete
+                ).execute(context=kwargs) # Execute the operator directly
+            else:
+                print(f"[{APPROVER_NAME}] No tasks found in QUEUED state. No new DAG run triggered.")
+            
+        except Exception as e:
+            print(f"[{APPROVER_NAME}] Error in check_and_trigger_newly_queued_tasks: {e}")
+            raise AirflowFailException(f"Error checking/triggering new DAG run: {e}")
+        finally:
+            if mongo_client:
+                mongo_client.close()
+                print(f"[{APPROVER_NAME}] MongoDB client closed.")
+
+    # Define the dependency: `check_and_trigger_newly_queued_tasks` runs after all
+    # instances of `execute_and_transition_task` have completed.
+    check_and_trigger_newly_queued_tasks() << execute_tasks_result
 
 # Instantiate the DAG
 reflow_kafka_task_executor_dag_v4()
