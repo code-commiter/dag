@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom; // For random numbers
+import java.util.ArrayList; // Added for collecting phase IDs
 
 @Service
 @RequiredArgsConstructor
@@ -52,9 +53,12 @@ public class DataGeneratorService {
 
         // 3. Create Phases and Tasks
         String lastPhaseId = null;
+        List<String> phaseIdsForRelease = new ArrayList<>(); // To collect phase IDs for the release
+
         for (int i = 0; i < numPhases; i++) {
             String phaseName = "Phase " + (i + 1) + " for " + releaseName;
             Phase phase = createDummyPhase(release.getId(), phaseName, lastPhaseId, ParentType.RELEASE);
+            phaseIdsForRelease.add(phase.getId()); // Add phase ID to the list
 
             // Update previous phase's nextPhaseId
             if (lastPhaseId != null) {
@@ -70,6 +74,12 @@ public class DataGeneratorService {
             // Create Tasks within this phase
             createDummyTasksForPhase(phase.getId(), release.getId(), tasksPerPhase);
         }
+
+        // AFTER all phases are created, update the Release with the list of phase IDs
+        release.setPhaseIds(phaseIdsForRelease);
+        releaseRepository.save(release);
+        System.out.println("Updated Release " + release.getId() + " with phase IDs: " + phaseIdsForRelease);
+
 
         // 4. Create Release Context (Optional, but ensures all top-level entities are linked)
         ReleaseContext releaseContext = createDummyReleaseContext(releaseGroup.getId(), release.getId());
@@ -168,6 +178,7 @@ public class DataGeneratorService {
     private void createDummyTasksForPhase(String phaseId, String releaseId, int count) {
         String lastTaskIdInPhase = null;
         String groupTaskId = null; // To hold the ID of a potential group task
+        List<String> taskIdsForPhase = new ArrayList<>(); // To collect task IDs for the phase
 
         // Optionally create a Task Group early in the phase
         if (count >= 3 && ThreadLocalRandom.current().nextDouble() < 0.3) { // 30% chance to have a group
@@ -185,11 +196,13 @@ public class DataGeneratorService {
             );
             groupTask.setTaskVariables(Map.of("groupPurpose", "A collection of related tasks"));
             taskRepository.save(groupTask);
+            taskIdsForPhase.add(groupTask.getId()); // Add group task ID to phase's task list
             System.out.println("  Created Task Group: " + groupTask.getName() + " (ID: " + groupTask.getId() + ") in Phase: " + phaseId);
             lastTaskIdInPhase = groupTask.getId(); // Group becomes the last task in phase for now
 
             // Create some tasks inside this group
             String lastTaskIdInGroup = null;
+            List<String> childTaskIdsForGroup = new ArrayList<>(); // Collect child task IDs for the group task
             int tasksInGroup = ThreadLocalRandom.current().nextInt(2, 5); // 2 to 4 tasks in group
             for (int j = 0; j < tasksInGroup; j++) {
                 TaskType type = getRandomTaskType(false); // No groups inside groups
@@ -206,6 +219,7 @@ public class DataGeneratorService {
                     lastTaskIdInGroup // Link to previous task in group
                 );
                 taskRepository.save(task);
+                childTaskIdsForGroup.add(task.getId()); // Add child task ID to group's child list
                 if (lastTaskIdInGroup != null) {
                     taskRepository.findById(lastTaskIdInGroup).ifPresent(prevTask -> {
                         prevTask.setNextTaskId(task.getId());
@@ -215,8 +229,9 @@ public class DataGeneratorService {
                 lastTaskIdInGroup = task.getId();
                 System.out.println("    Created Group Child Task: " + task.getName() + " (ID: " + task.getId() + ") in Group: " + groupTaskId);
             }
-            // The last task in the group's nextTaskId remains null, signifying end of group sequence
-            // The next task in the phase (if any) will link to the groupTaskId itself, not its children.
+            // Update the group task with its children
+            groupTask.setChildTaskIds(childTaskIdsForGroup);
+            taskRepository.save(groupTask);
         }
 
         // Create remaining tasks directly in the phase
@@ -239,6 +254,7 @@ public class DataGeneratorService {
                 currentPhaseLastTaskId // Link to previous task in phase
             );
             taskRepository.save(task);
+            taskIdsForPhase.add(task.getId()); // Add regular task ID to phase's task list
 
             if (currentPhaseLastTaskId != null) {
                 // Update the previous task's nextTaskId
@@ -250,6 +266,13 @@ public class DataGeneratorService {
             currentPhaseLastTaskId = task.getId();
             System.out.println("  Created Phase Task: " + task.getName() + " (ID: " + task.getId() + ") in Phase: " + phaseId);
         }
+
+        // AFTER all tasks for the phase are created, update the Phase with the list of task IDs
+        phaseRepository.findById(phaseId).ifPresent(phase -> {
+            phase.setTaskIds(taskIdsForPhase);
+            phaseRepository.save(phase);
+            System.out.println("Updated Phase " + phase.getId() + " with task IDs: " + taskIdsForPhase);
+        });
     }
 
 
