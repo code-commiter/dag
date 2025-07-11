@@ -1,8 +1,848 @@
-query = {
-                "state": "QUEUED",
-                "type": {"$ne": "SCHEDULER"}, # Exclude SCHEDULER tasks, as they are managed by reflow_scheduler_monitor_dag
+# dags/reflow_kafka_task_executor_dag_v4.py
+# This Airflow DAG now operates in a Kafka-driven manner:
+# 1.  It polls MongoDB for 'QUEUED' tasks and publishes them as events to Kafka.
+# 2.  It then consumes these Kafka events to trigger task execution.
+# 3.  **Hybrid Write Strategy with Redis Lock**:
+#     - An **advisory Redis lock** is acquired first to reduce contention.
+#     - The initial claim (QUEUED to IN_PROGRESS) is an **eager, atomic write to MongoDB**
+#       to explicitly claim the task and prevent duplicate work execution.
+#     - All subsequent state transitions (COMPLETED, FAILED, etc.) are **lazy writes to Kafka**,
+#       to be eventually persisted by a dedicated Kafka consumer service.
+# This ensures both strong guarantees against duplicate work and scalable, decoupled state updates.
+# **UPDATED**: Now includes logic for Parallel Group and Sequential Group task completion.
+
+from __future__ import annotations
+
+import pendulum
+import json
+import time
+import subprocess # For executing external scripts
+import os         # NEW: For path manipulation
+import sys        # NEW: For checking exception info in finally block
+
+from airflow.decorators import dag, task
+from airflow.exceptions import AirflowFailException, AirflowRescheduleException
+
+# Confluent Kafka Python client - needs to be installed in Airflow environment:
+# pip install confluent-kafka
+from confluent_kafka import Consumer, Producer, KafkaException
+
+# PyMongo - Python driver for MongoDB - needs to be installed in Airflow environment:
+# pip install pymongo
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, OperationFailure
+
+# Redis Python client - needs to be installed in Airflow environment:
+# pip install redis
+import redis
+
+# Import common utilities and configuration constants
+from reflow_dag_utils import (
+    get_mongo_client,
+    update_entity_state_in_mongodb, # Used for the eager claim
+    get_terminal_states,
+    publish_kafka_message, # Used for lazy writes
+    MONGO_DB_NAME
+)
+# Import configuration constants for Python script execution and Redis
+from airflow_config import (
+    PYTHON_EXECUTABLE_PATH, # NEW
+    SCRIPT_BASE_PATH,       # NEW
+    KAFKA_BROKER_SERVERS, # Needed for Kafka consumer config
+    KAFKA_TASK_EVENTS_TOPIC,
+    KAFKA_ENTITY_STATE_CHANGES_TOPIC,
+    APPROVER_NAME_SYSTEM as APPROVER_NAME,
+    MAX_TASKS_PER_DAG_RUN,
+    KAFKA_CONSUMER_GROUP_ID_EXECUTOR,
+    REDIS_HOST,
+    REDIS_PORT,
+    REDIS_DB,
+    REDIS_LOCK_TTL_SECONDS
+)
+
+# Define common state constants for readability
+STATE_PLANNED = "PLANNED"
+STATE_QUEUED = "QUEUED"
+STATE_IN_PROGRESS = "IN_PROGRESS"
+STATE_COMPLETED = "COMPLETED"
+STATE_FAILED = "FAILED"
+STATE_REJECTED = "REJECTED"
+STATE_BLOCKED = "BLOCKED"
+STATE_WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
+STATE_APPROVED = "APPROVED"
+STATE_SKIPPED = "SKIPPED"
+STATE_SCHEDULED = "SCHEDULED"
+STATE_ARCHIVED = "ARCHIVED"
+STATE_RETRY = "RETRY"
+
+# Define common task type constants for readability
+TASK_TYPE_REGULAR = "REGULAR"
+TASK_TYPE_APPROVAL = "APPROVAL"
+TASK_TYPE_PARALLEL_GROUP = "PARALLEL_GROUP"
+TASK_TYPE_SEQUENTIAL_GROUP = "SEQUENTIAL_GROUP"
+TASK_TYPE_SCHEDULER = "SCHEDULER"
+TASK_TYPE_TRIGGER = "TRIGGER"
+
+# Define common gate status constants
+GATE_STATUS_APPROVED = "APPROVED"
+GATE_STATUS_REJECTED = "REJECTED"
+GATE_STATUS_PENDING = "PENDING"
+
+@dag(
+    dag_id="reflow_kafka_task_executor_v4",
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
+    schedule="*/1 * * * *",
+    catchup=False,
+    tags=["reflow", "mongodb", "workflow", "tasks", "orchestration", "kafka", "hybrid-write", "redis", "python-executor", "group-tasks"], # Updated tags
+    doc_md="""
+    ### Reflow Kafka Task Executor DAG (v4 - Kafka-Driven Task Execution with Hybrid Lazy/Eager Writes and Redis Lock)
+    This DAG now implements a hybrid "lazy/eager write" strategy for state transitions,
+    enhanced with a Redis distributed lock for pre-emptive contention reduction.
+    **Task execution is now done via external Python scripts.**
+    **UPDATED**: Includes comprehensive logic for completing PARALLEL_GROUP and SEQUENTIAL_GROUP tasks
+    when their children reach terminal states, and for queuing the next task in a sequential group.
+    1.  It polls MongoDB for 'QUEUED' tasks and publishes them as events to Kafka.
+    2.  It then consumes these Kafka events to trigger task execution.
+    3.  **Hybrid Write Strategy**:
+        - An **advisory Redis lock** is acquired first to reduce contention.
+        - The initial claim (QUEUED to IN_PROGRESS) is an **eager, atomic write to MongoDB**
+          to explicitly claim the task and prevent duplicate work execution.
+        - All subsequent state transitions (COMPLETED, FAILED, etc.) are **lazy writes to Kafka**,
+          to be eventually persisted by a dedicated Kafka consumer service.
+    This ensures both strong guarantees against duplicate work and scalable, decoupled state updates.
+    """
+)
+def reflow_kafka_task_executor_dag_v4():
+
+    # Initialize Redis client globally to reuse connections
+    redis_client = None # Initialize to None in case of connection error
+    try:
+        redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+        # Ping to check connection
+        redis_client.ping()
+        print(f"[{APPROVER_NAME}] Successfully connected to Redis at {REDIS_HOST}:{REDIS_DB}")
+    except redis.exceptions.ConnectionError as e:
+        print(f"[{APPROVER_NAME}] ERROR: Could not connect to Redis at {REDIS_HOST}:{REDIS_PORT}. Redis features will be unavailable. {e}")
+        # redis_client remains None, logic will handle this
+    except Exception as e:
+        print(f"[{APPROVER_NAME}] ERROR: An unexpected error occurred during Redis client initialization: {e}")
+        redis_client = None
+
+    @task
+    def poll_db_and_publish_to_kafka():
+        """
+        Connects to MongoDB, queries for tasks in 'QUEUED' state that are ready for execution,
+        and publishes them as messages to the Kafka 'reflow_task_events' topic.
+        This task acts as a Kafka producer.
+        Returns True if any tasks were published, None otherwise.
+        """
+        mongo_client = None
+        tasks_published_count = 0
+        try:
+            mongo_client = get_mongo_client(APPROVER_NAME)
+            db = mongo_client[MONGO_DB_NAME]
+            tasks_collection = db.tasks
+
+            now_utc = pendulum.now("UTC").replace(microsecond=0)
+
+            print(f"[{APPROVER_NAME}] Polling MongoDB for QUEUED tasks ready for Kafka publishing at {now_utc.isoformat()}.")
+
+            # Query for tasks that are QUEUED, NOT of type SCHEDULER,
+            # and whose scheduledTime is either null OR less than or equal to current time.
+            query = {
+                "state": STATE_QUEUED,
+                "type": {"$ne": TASK_TYPE_SCHEDULER},
                 "$or": [
                     {"scheduledTime": None},
                     {"scheduledTime": {"$lte": now_utc}}
                 ]
             }
+            
+            # Find tasks that match the criteria, and **limit the number of tasks fetched**
+            queued_tasks_cursor = tasks_collection.find(query).limit(MAX_TASKS_PER_DAG_RUN)
+            
+            for task_doc in queued_tasks_cursor:
+                task_doc['id'] = str(task_doc['_id'])
+                del task_doc['_id'] 
+                
+                print(f"[{APPROVER_NAME}] Publishing QUEUED task to Kafka: {task_doc.get('name')} (ID: {task_doc.get('id')})")
+                
+                publish_kafka_message(KAFKA_TASK_EVENTS_TOPIC, task_doc['id'], task_doc, approver_name=APPROVER_NAME)
+                tasks_published_count += 1
+
+        except (ConnectionFailure, OperationFailure) as e:
+            print(f"[{APPROVER_NAME}] MongoDB connection/operation failed during polling for Kafka: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Failed to query MongoDB for queued tasks to publish: {e}")
+        except Exception as e:
+            print(f"[{APPROVER_NAME}] An unexpected error occurred during MongoDB polling/Kafka publishing: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Failed during Kafka publishing: {e}")
+        finally:
+            if mongo_client:
+                mongo_client.close()
+                print(f"[{APPROVER_NAME}] MongoDB client closed.")
+
+        if tasks_published_count == 0:
+            print(f"[{APPROVER_NAME}] No new QUEUED tasks found to publish to Kafka in this run.")
+            return None
+        
+        print(f"[{APPROVER_NAME}] Published {tasks_published_count} tasks to Kafka.")
+        return True
+
+    @task
+    def consume_kafka_events():
+        """
+        Consumes messages from the Kafka 'reflow_task_events' topic.
+        It returns a list of task data dictionaries to be processed by downstream tasks.
+        """
+        conf = {
+            'bootstrap.servers': KAFKA_BROKER_SERVERS,
+            'group.id': KAFKA_CONSUMER_GROUP_ID_EXECUTOR,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': True,
+            'session.timeout.ms': 10000,
+            'heartbeat.interval.ms': 3000
+        }
+        consumer = Consumer(conf)
+        processed_tasks_data = []
+
+        try:
+            consumer.subscribe([KAFKA_TASK_EVENTS_TOPIC])
+            print(f"[{APPROVER_NAME}] Subscribed to Kafka topic: {KAFKA_TASK_EVENTS_TOPIC} with group ID {KAFKA_CONSUMER_GROUP_ID_EXECUTOR}")
+
+            poll_duration_seconds = 30
+            start_time = time.time()
+            while time.time() - start_time < poll_duration_seconds:
+                msg = consumer.poll(timeout=1.0)
+
+                if msg is None:
+                    continue
+                if msg.error():
+                    if msg.error().is_fatal():
+                        raise KafkaException(msg.error())
+                    else:
+                        print(f"[{APPROVER_NAME}] Consumer error: {msg.error()}")
+                        continue
+
+                try:
+                    task_data = json.loads(msg.value().decode('utf-8'))
+                    task_id = task_data.get("id")
+                    task_state = task_data.get("state")
+                    task_name = task_data.get("name")
+
+                    print(f"[{APPROVER_NAME}] Consumed message for task: {task_name} (ID: {task_id}), State: {task_state}")
+
+                    if task_state == STATE_QUEUED:
+                        processed_tasks_data.append(task_data)
+                    else:
+                        print(f"[{APPROVER_NAME}] Task {task_name} (ID: {task_id}) is in state {task_state}, not QUEUED. Skipping processing by this DAG.")
+
+                except json.JSONDecodeError as e:
+                    print(f"[{APPROVER_NAME}] Error decoding JSON message: {e} - Raw message: {msg.value().decode('utf-8')}")
+                except Exception as e:
+                    print(f"[{APPROVER_NAME}] Unexpected error processing Kafka message: {e}")
+
+        except KafkaException as e:
+            print(f"[{APPROVER_NAME}] Kafka consumer error: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Kafka consumer failed: {e}")
+        except Exception as e:
+            print(f"[{APPROVER_NAME}] An unexpected error occurred during Kafka consumption: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Failed during Kafka consumption: {e}")
+        finally:
+            consumer.close()
+            print(f"[{APPROVER_NAME}] Kafka consumer closed. Processed {len(processed_tasks_data)} tasks.")
+
+        if not processed_tasks_data:
+            print(f"[{APPROVER_NAME}] No new QUEUED tasks found to execute from Kafka in this run.")
+            return None
+
+        return processed_tasks_data
+
+    def _publish_state_change_event(entity_type: str, entity_id: str, old_state_condition: str | None, new_state: str, reason: str, additional_fields: dict = None):
+        """
+        Helper to publish a state change event to Kafka.
+        This is used for "lazy" updates (from IN_PROGRESS onwards).
+        """
+        print(f"[{APPROVER_NAME}] Publishing state change event for {entity_type} {entity_id} from {old_state_condition if old_state_condition else 'any state'} to {new_state}...")
+        event_payload = {
+            "entityType": entity_type,
+            "entityId": entity_id,
+            "newState": new_state,
+            "approvedBy": APPROVER_NAME,
+            "reason": reason,
+            "timestamp": pendulum.now("UTC").isoformat()
+        }
+        if old_state_condition:
+            event_payload["oldStateCondition"] = old_state_condition
+        if additional_fields:
+            event_payload.update(additional_fields)
+        
+        publish_kafka_message(KAFKA_ENTITY_STATE_CHANGES_TOPIC, entity_id, event_payload, approver_name=APPROVER_NAME)
+        print(f"[{APPROVER_NAME}] Event published for {entity_type} {entity_id} to {new_state}.")
+        return True
+
+    def _append_task_logs_in_mongodb(db, task_id: str, log_content: str):
+        """
+        Appends new log content to a task's 'logs' field in MongoDB.
+        This remains a direct DB write as it's an operational log, not a core state transition.
+        """
+        if not log_content or not log_content.strip():
+            return # Don't append empty logs
+
+        timestamp = pendulum.now("UTC").isoformat()
+        log_entry = f"\n--- Log Entry [{timestamp}] ---\n{log_content}"
+        
+        try:
+            result = db.tasks.update_one(
+                {"_id": task_id},
+                {"$set": {"updatedAt": timestamp}, "$concat": {"logs": log_entry}}
+            )
+            if result.modified_count == 1:
+                print(f"[{APPROVER_NAME}] Appended logs to task {task_id}.")
+            else:
+                print(f"[{APPROVER_NAME}] Warning: Failed to append logs to task {task_id}. Task not found or not modified.")
+        except OperationFailure as e:
+            print(f"[{APPROVER_NAME}] MongoDB operation failed while appending logs for {task_id}: {e}")
+        except Exception as e:
+            print(f"[{APPROVER_NAME}] Unexpected error appending logs for {task_id}: {e}")
+
+    def _execute_python_script(db, task_data: dict) -> bool: # Renamed from _execute_jar_task
+        """
+        Executes an external Python script for REGULAR or TRIGGER tasks.
+        The script name is based on the task's 'actor' field: {actor}_script.py
+        Returns True for success, False for failure.
+        """
+        task_id = task_data.get("id")
+        task_name = task_data.get("name")
+        task_type = task_data.get("type")
+        phase_id = task_data.get("phaseId")
+        release_id = task_data.get("releaseId")
+        # The 'actor' field from task_data will determine the script name
+        actor = task_data.get("actor", APPROVER_NAME) 
+
+        # Construct the full path to the Python script
+        python_script_name = f"{actor}_script.py"
+        script_full_path = os.path.join(SCRIPT_BASE_PATH, python_script_name)
+
+        print(f"[{APPROVER_NAME}] Attempting to execute Python script: {script_full_path} for task_id: {task_id} with Actor: {actor}...")
+
+        # Prepare the command to execute the Python script
+        command = [
+            PYTHON_EXECUTABLE_PATH,
+            script_full_path,
+            "--task-id", task_id,
+            "--task-name", task_name,
+            "--task-type", task_type,
+            "--phase-id", phase_id,
+            "--release-id", release_id if release_id else "null", # Handle optional releaseId
+            "--actor", actor,
+            # Add any other parameters your script might need
+        ]
+        
+        print(f"[{APPROVER_NAME}] Executing command: {' '.join(command)}")
+        try:
+            # For actual execution:
+            process = subprocess.run(command, capture_output=True, text=True, check=False)
+            is_success = process.returncode == 0
+            script_logs = process.stdout + "\n" + process.stderr
+
+            if is_success:
+                print(f"[{APPROVER_NAME}] Python script for {task_id} executed successfully.")
+            else:
+                print(f"[{APPROVER_NAME}] Python script for {task_id} failed with exit code {process.returncode}.")
+            
+        except FileNotFoundError:
+            is_success = False
+            script_logs = f"Error: Python executable '{PYTHON_EXECUTABLE_PATH}' or script '{script_full_path}' not found."
+            print(f"[{APPROVER_NAME}] {script_logs}")
+        except subprocess.CalledProcessError as e:
+            is_success = False
+            script_logs = f"Python script execution failed with error: {e.stderr}"
+            print(f"[{APPROVER_NAME}] Python script execution failed for {task_id}: {e}")
+        except Exception as e:
+            is_success = False
+            script_logs = f"Unexpected error during Python script execution: {e}"
+            print(f"[{APPROVER_NAME}] Unexpected error during Python script execution for {task_id}: {e}")
+        
+        _append_task_logs_in_mongodb(db, task_id, script_logs)
+        return is_success
+
+    def _handle_regular_task(db, task_data: dict) -> str:
+        """Handles the execution and state transition for REGULAR tasks."""
+        task_id = task_data.get("id")
+        is_success = _execute_python_script(db, task_data) # Call renamed function
+        
+        final_state = STATE_COMPLETED if is_success else STATE_FAILED
+        reason = f"Python script execution {'succeeded' if is_success else 'failed'}. ({APPROVER_NAME})"
+        
+        _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, final_state, reason)
+        return final_state
+
+    def _handle_approval_task(db, task_data: dict) -> str:
+        """Handles the state transition for APPROVAL tasks based on their gateStatus."""
+        task_id = task_data.get("id")
+        gate_status = task_data.get("gateStatus") # This is the status from MongoDB
+
+        if gate_status == GATE_STATUS_APPROVED:
+            reason = f"Gate task passed and completed by {APPROVER_NAME}"
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_COMPLETED, reason, {"gateStatus": GATE_STATUS_APPROVED})
+            return STATE_COMPLETED
+        elif gate_status == GATE_STATUS_REJECTED:
+            reason = f"Gate task failed. ({APPROVER_NAME})"
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_FAILED, reason, {"gateStatus": GATE_STATUS_REJECTED})
+            return STATE_FAILED
+        else: # PENDING or other states
+            reason = f"Gate task awaiting external approval. ({APPROVER_NAME})"
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_WAITING_FOR_APPROVAL, reason, {"gateStatus": GATE_STATUS_PENDING})
+            return STATE_WAITING_FOR_APPROVAL
+
+    def _handle_parallel_group_task(db, task_data: dict) -> str:
+        """Queues all child tasks for a PARALLEL_GROUP task by publishing Kafka events."""
+        task_id = task_data.get("id")
+        child_task_ids = task_data.get("childTaskIds", [])
+
+        if not child_task_ids:
+            print(f"[{APPROVER_NAME}] Parallel Group task {task_id} has no children. Publishing COMPLETED event.")
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_COMPLETED, f"Parallel Group task completed as no children found by {APPROVER_NAME}.")
+            return STATE_COMPLETED
+
+        print(f"[{APPROVER_NAME}] Publishing QUEUED events for all {len(child_task_ids)} children for PARALLEL_GROUP {task_id}.")
+        for child_id in child_task_ids:
+            _publish_state_change_event("Task", child_id, STATE_PLANNED, STATE_QUEUED,
+                                        f"Queued by parent PARALLEL_GROUP {task_id} by {APPROVER_NAME}.")
+            print(f"[{APPROVER_NAME}] Child task {child_id} QUEUED event published for parallel execution.")
+        
+        # A parallel group task itself remains IN_PROGRESS until all its children are terminal.
+        # This check is done by _check_and_transition_parent_states when children complete.
+        return STATE_IN_PROGRESS
+
+    def _handle_sequential_group_task(db, task_data: dict) -> str:
+        """Queues the first child task for a SEQUENTIAL_GROUP task by publishing a Kafka event."""
+        task_id = task_data.get("id")
+        
+        print(f"[{APPROVER_NAME}] Queuing first child for SEQUENTIAL_GROUP {task_id}.")
+        
+        # Find the first child task (one with no previousTaskId and belonging to this group)
+        first_child_tasks_cursor = db.tasks.find({"groupId": task_id, "previousTaskId": None})
+        first_child_tasks = list(first_child_tasks_cursor)
+
+        if first_child_tasks:
+            first_child_id = first_child_tasks[0].get("_id")
+            _publish_state_change_event("Task", first_child_id, STATE_PLANNED, STATE_QUEUED,
+                                        f"Queued by parent SEQUENTIAL_GROUP {task_id} by {APPROVER_NAME}.")
+            print(f"[{APPROVER_NAME}] First child task {first_child_id} QUEUED event published for sequential execution.")
+        else:
+            print(f"[{APPROVER_NAME}] SEQUENTIAL_GROUP {task_id} has no starting child or no children. Publishing COMPLETED event.")
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_COMPLETED, f"Sequential group completed as no starting child found by {APPROVER_NAME}.")
+            return STATE_COMPLETED
+
+        # A sequential group task itself remains IN_PROGRESS until its last child completes.
+        # This check is done by _queue_next_task_after_completion and _check_and_transition_parent_states.
+        return STATE_IN_PROGRESS
+
+    def _handle_trigger_task(db, task_data: dict) -> str:
+        """
+        Executes a Python script for a TRIGGER task and defers the Airflow task
+        if the script indicates it's still in progress, or completes it if done.
+        """
+        task_id = task_data.get("id")
+        trigger_interval = task_data.get("triggerInterval", 30)
+
+        is_success = _execute_python_script(db, task_data) # Call renamed function
+
+        current_db_task = db.tasks.find_one({"_id": task_id})
+        if not current_db_task:
+            print(f"[{APPROVER_NAME}] Trigger task {task_id} not found after script execution. Assuming failure.")
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_FAILED, f"Trigger task not found after script execution. ({APPROVER_NAME})")
+            return STATE_FAILED
+
+        task_state_after_script = current_db_task.get("state")
+
+        if task_state_after_script in get_terminal_states():
+            print(f"[{APPROVER_NAME}] TRIGGER task {task_id} is now in terminal state: {task_state_after_script}. Completing Airflow task.")
+            return task_state_after_script
+        else:
+            print(f"[{APPROVER_NAME}] TRIGGER task {task_id} still in state {task_state_after_script}. Deferring for {trigger_interval} seconds.")
+            raise AirflowRescheduleException(f"TRIGGER task {task_id} deferred. Will retry in {trigger_interval} seconds.",
+                                             reschedule_after=pendulum.duration(seconds=trigger_interval))
+
+    def _handle_scheduler_task(db, task_data: dict) -> str:
+        """Handles SCHEDULER tasks by simply publishing a COMPLETED event."""
+        task_id = task_data.get("id")
+        print(f"[{APPROVER_NAME}] SCHEDULER task {task_id} processed. Publishing COMPLETED event.")
+        _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_COMPLETED, f"SCHEDULER task time reached and processed by DAG. ({APPROVER_NAME})")
+        return STATE_COMPLETED
+
+    def _queue_next_task_after_completion(db, completed_task: dict):
+        """
+        Queues the next task in sequence if the current task completed successfully
+        by publishing a Kafka event. Also handles sequential group progression.
+        """
+        task_id = completed_task.get("id")
+        next_task_id = completed_task.get("nextTaskId")
+        group_id = completed_task.get("groupId")
+        terminal_states = get_terminal_states()
+
+        # Handle sequential group progression
+        if group_id:
+            parent_group_task = db.tasks.find_one({"_id": group_id})
+            if parent_group_task and parent_group_task.get("type") == TASK_TYPE_SEQUENTIAL_GROUP:
+                print(f"[{APPROVER_NAME}] Task {task_id} is a child of SEQUENTIAL_GROUP {group_id}.")
+                if next_task_id:
+                    # If there's a next task within the sequential group, queue it
+                    print(f"[{APPROVER_NAME}] Queuing next task {next_task_id} within sequential group {group_id}.")
+                    _publish_state_change_event("Task", next_task_id, STATE_PLANNED, STATE_QUEUED,
+                                                f"Queued by completion of previous task {task_id} in sequential group {group_id} by {APPROVER_NAME}.")
+                    return # Do not proceed to check parent group completion here, as there are more tasks in sequence
+
+                else: # This is the last task in the sequential group
+                    print(f"[{APPROVER_NAME}] Task {task_id} is the last child of SEQUENTIAL_GROUP {group_id}. Marking group as COMPLETED.")
+                    _publish_state_change_event("Task", group_id, STATE_IN_PROGRESS, STATE_COMPLETED,
+                                                f"SEQUENTIAL_GROUP {group_id} completed as its last child {task_id} finished. ({APPROVER_NAME})")
+                    
+                    # After the sequential group itself completes, check its own next task and parent states
+                    # This will trigger the next task after the group, if any.
+                    group_next_task_id = parent_group_task.get("nextTaskId")
+                    if group_next_task_id:
+                        print(f"[{APPROVER_NAME}] Queuing next task {group_next_task_id} after sequential group {group_id}.")
+                        _publish_state_change_event("Task", group_next_task_id, STATE_PLANNED, STATE_QUEUED,
+                                                    f"Queued by completion of sequential group {group_id} by {APPROVER_NAME}.")
+                    
+                    # Recursively check parent states for the completed group task
+                    _check_and_transition_parent_states(db, group_id, parent_group_task.get("phaseId"), parent_group_task.get("groupId"))
+                    return # Handled sequential group completion and progression
+
+        # If not part of a sequential group, or if it's a parallel group child, proceed with regular next task logic
+        if next_task_id:
+            print(f"[{APPROVER_NAME}] Task {task_id} completed. Publishing QUEUED event for next task: {next_task_id}")
+            _publish_state_change_event("Task", next_task_id, STATE_PLANNED, STATE_QUEUED,
+                                        f"Queued by completion of previous task {task_id} by {APPROVER_NAME}.")
+        else:
+            print(f"[{APPROVER_NAME}] Task {task_id} is the last in its immediate sequence. Checking parent state progression.")
+
+    def _check_and_transition_parent_states(db, completed_child_id, child_phase_id, child_group_id):
+        """
+        Helper function to check if parent entities (group, phase, release, release group)
+        can transition their state to COMPLETED based on all their children being terminal.
+        This function recursively checks up the hierarchy and publishes Kafka events for transitions.
+        """
+        terminal_states = get_terminal_states()
+
+        # 1. Check Group Task Completion (if the completed_child_id belongs to a group)
+        if child_group_id:
+            parent_group_task = db.tasks.find_one({"_id": child_group_id})
+            if parent_group_task and parent_group_task.get("state") != STATE_COMPLETED:
+                group_children_ids = parent_group_task.get("childTaskIds", [])
+                
+                all_group_children_terminal = True
+                for child_id in group_children_ids:
+                    child_task = db.tasks.find_one({"_id": child_id})
+                    # A child is considered terminal if its state is in terminal_states
+                    # or if it's an APPROVAL task whose gateStatus is APPROVED/REJECTED (its state might be WAITING_FOR_APPROVAL/IN_PROGRESS)
+                    if child_task and (child_task.get("state") not in terminal_states):
+                        # Special check for APPROVAL tasks: if state is WAITING_FOR_APPROVAL but gateStatus is APPROVED/REJECTED, it's terminal for group purposes
+                        if not (child_task.get("type") == TASK_TYPE_APPROVAL and child_task.get("gateStatus") in [GATE_STATUS_APPROVED, GATE_STATUS_REJECTED]):
+                            all_group_children_terminal = False
+                            break
+                
+                if all_group_children_terminal:
+                    print(f"[{APPROVER_NAME}] All children of group task {child_group_id} are terminal. Publishing COMPLETED event for group.")
+                    _publish_state_change_event("Task", child_group_id, parent_group_task.get("state"), STATE_COMPLETED,
+                        f"Group task completed as all children are terminal by {APPROVER_NAME}.")
+                    
+                    # After a group task completes, recursively check its own parent (phase or another group)
+                    _check_and_transition_parent_states(db, child_group_id, parent_group_task.get("phaseId"), parent_group_task.get("groupId"))
+                    return # Group completion handled, exit to prevent redundant phase/release checks for this child
+
+        # 2. Check Phase Completion (if the completed_child_id belongs to a phase, or a group that just completed)
+        if child_phase_id:
+            phase_tasks_cursor = db.tasks.find({"phaseId": child_phase_id})
+            all_phase_tasks = list(phase_tasks_cursor)
+            
+            all_phase_tasks_terminal = True
+            for pt in all_phase_tasks:
+                if pt.get("state") not in terminal_states:
+                    # Special check for APPROVAL tasks: if state is WAITING_FOR_APPROVAL but gateStatus is APPROVED/REJECTED, it's terminal for phase purposes
+                    if not (pt.get("type") == TASK_TYPE_APPROVAL and pt.get("gateStatus") in [GATE_STATUS_APPROVED, GATE_STATUS_REJECTED]):
+                        all_phase_tasks_terminal = False
+                        break
+
+            if all_phase_tasks_terminal:
+                current_phase_doc = db.phases.find_one({"_id": child_phase_id})
+                if current_phase_doc and current_phase_doc.get("state") != STATE_COMPLETED:
+                    print(f"[{APPROVER_NAME}] All tasks in phase {child_phase_id} are terminal. Publishing COMPLETED event for phase.")
+                    _publish_state_change_event("Phase", child_phase_id, current_phase_doc.get("state"), STATE_COMPLETED,
+                        f"Phase completed as all tasks are terminal by {APPROVER_NAME}.")
+                    
+                    # Handle cascading gates for Release Group phases (if applicable)
+                    if current_phase_doc.get("parentType") == "RELEASE_GROUP":
+                        # Fetch the original gate task that completed (if it was a gate directly under this phase)
+                        original_gate_task_doc = db.tasks.find_one({"_id": completed_child_id, "isGate": True})
+                        if original_gate_task_doc:
+                            release_group_id = current_phase_doc.get("parentId")
+                            gate_task_name = original_gate_task_doc.get("name")
+                            gate_final_state = original_gate_task_doc.get("state") # Should be COMPLETED or FAILED
+                            gate_final_gate_status = original_gate_task_doc.get("gateStatus") # Should be APPROVED or REJECTED
+
+                            print(f"[{APPROVER_NAME}] Phase {child_phase_id} is a Release Group gate phase. Triggering cascading event for RG: {release_group_id} based on gate task {completed_child_id}.")
+                            
+                            releases_in_group_cursor = db.releases.find({"releaseGroupId": release_group_id})
+                            releases_in_group = list(releases_in_group_cursor)
+
+                            for rel in releases_in_group:
+                                release_phases_cursor = db.phases.find({"parentId": rel.get("_id"), "parentType": "RELEASE"})
+                                release_phases = list(release_phases_cursor)
+
+                                for rp in release_phases:
+                                    matching_gate_tasks_cursor = db.tasks.find({
+                                        "phaseId": rp.get("_id"),
+                                        "isGate": True,
+                                        "name": gate_task_name # Match by name
+                                    })
+                                    matching_gate_tasks = list(matching_gate_tasks_cursor)
+
+                                    for cascaded_gate_task in matching_gate_tasks:
+                                        print(f"[{APPROVER_NAME}] Publishing Kafka event to cascade gate status for Release {rel.get('id')}, Phase {rp.get('_id')}, Task {cascaded_gate_task.get('_id')}")
+                                        
+                                        # Publish the event to be picked up by the cascading DAG
+                                        publish_kafka_message(
+                                            KAFKA_TASK_EVENTS_TOPIC, # Use task events topic
+                                            str(cascaded_gate_task.get("_id")),
+                                            {
+                                                "id": str(cascaded_gate_task.get("_id")),
+                                                "name": cascaded_gate_task.get("name"),
+                                                "state": gate_final_state, # Use the final state of the original gate (COMPLETED/FAILED)
+                                                "type": cascaded_gate_task.get("type"),
+                                                "phaseId": cascaded_gate_task.get("phaseId"),
+                                                "releaseId": cascaded_gate_task.get("releaseId"),
+                                                "isGate": True,
+                                                "gateStatus": gate_final_gate_status, # Use the final gateStatus (APPROVED/REJECTED)
+                                                "actor": "SYSTEM_CASCADER", # Indicate system action
+                                                "approvedBy": APPROVER_NAME,
+                                                "approvalDate": pendulum.now("UTC").isoformat(),
+                                                "reason": f"Cascaded from Release Group Gate '{gate_task_name}' (ID: {original_gate_task_doc.get('_id')})."
+                                            },
+                                            approver_name=APPROVER_NAME
+                                        )
+                                        break # Assuming one matching gate task per phase for cascading
+
+                    # After phase completion, queue the next phase if it exists and is PLANNED
+                    next_phase_id = current_phase_doc.get("nextPhaseId")
+                    if next_phase_id:
+                        next_phase_doc = db.phases.find_one({"_id": next_phase_id})
+                        if next_phase_doc and next_phase_doc.get("state") == STATE_PLANNED:
+                            print(f"[{APPROVER_NAME}] Phase {child_phase_id} completed. Publishing IN_PROGRESS event for next phase {next_phase_id}.")
+                            _publish_state_change_event("Phase", next_phase_id, STATE_PLANNED, STATE_IN_PROGRESS,
+                                f"Auto-transitioned by completion of previous phase {child_phase_id} by {APPROVER_NAME}")
+                            
+                            # Find and queue the first task of the newly activated phase
+                            first_task_in_next_phase = db.tasks.find({"phaseId": next_phase_id, "previousTaskId": None, "groupId": None}).sort("createdAt", 1).limit(1)
+                            first_task_list = list(first_task_in_next_phase)
+                            if first_task_list:
+                                first_task_doc = first_task_list[0]
+                                print(f"[{APPROVER_NAME}] Publishing QUEUED event for first task {first_task_doc.get('_id')} of phase {next_phase_id}.")
+                                _publish_state_change_event("Task", str(first_task_doc.get("_id")), STATE_PLANNED, STATE_QUEUED,
+                                    f"Auto-queued as first task of phase {next_phase_id} initiated by {APPROVER_NAME}")
+                            else:
+                                print(f"[{APPROVER_NAME}] Warning: No starting task found for newly activated phase {next_phase_id}.")
+
+                    # Recursively check parent states for the completed phase
+                    _check_and_transition_parent_states(db, child_phase_id, current_phase_doc.get("parentId"), None)
+            
+        # 3. Check Release Completion (if the completed_child_id belongs to a release, or a phase that just completed)
+        if child_phase_id: # This check is triggered if a phase completed
+            parent_release = db.releases.find_one({"phaseIds": child_phase_id}) # Find the release that contains this phase
+            if parent_release and parent_release.get("state") != STATE_COMPLETED:
+                release_phases_cursor = db.phases.find({"parentId": parent_release.get("_id"), "parentType": "RELEASE"})
+                all_release_phases = list(release_phases_cursor)
+                
+                all_release_phases_terminal = True
+                for rp in all_release_phases:
+                    if rp.get("state") not in terminal_states:
+                        all_release_phases_terminal = False
+                        break
+
+                if all_release_phases_terminal:
+                    print(f"[{APPROVER_NAME}] All phases in Release {parent_release.get('_id')} are terminal. Publishing COMPLETED event for Release.")
+                    _publish_state_change_event("Release", parent_release.get("_id"), parent_release.get("state"), STATE_COMPLETED,
+                        f"Release completed as all phases are terminal by {APPROVER_NAME}.")
+                    
+                    # 4. Check Release Group Completion (if the completed_child_id belongs to a release group, or a release that just completed)
+                    if parent_release.get("releaseGroupId"):
+                        release_group_id = parent_release.get("releaseGroupId")
+                        release_group_doc = db.releaseGroups.find_one({"_id": release_group_id})
+                        if release_group_doc and release_group_doc.get("state") != STATE_COMPLETED:
+                            releases_in_group_cursor = db.releases.find({"releaseGroupId": release_group_id})
+                            all_group_releases = list(releases_in_group_cursor)
+
+                            all_group_releases_terminal = True
+                            for gr in all_group_releases:
+                                if gr.get("state") not in terminal_states:
+                                    all_group_releases_terminal = False
+                                    break
+
+                            if all_group_releases_terminal:
+                                print(f"[{APPROVER_NAME}] All releases in Release Group {release_group_id} are terminal. Publishing COMPLETED event for Release Group.")
+                                _publish_state_change_event("ReleaseGroup", release_group_id, release_group_doc.get("state"), STATE_COMPLETED,
+                                    f"Release Group completed as all releases are terminal by {APPROVER_NAME}.")
+
+
+    @task
+    def execute_and_transition_task(task_data: dict):
+        """
+        Executes a single task (simulated) and manages its state transitions,
+        including chaining to the next task and handling group/gate cascades.
+        Implements a hybrid lazy/eager write strategy, with an advisory Redis lock.
+        Task execution is now done via external Python scripts.
+        """
+        task_id = task_data.get("id")
+        task_name = task_data.get("name")
+        task_type = task_data.get("type")
+        phase_id = task_data.get("phaseId")
+        release_id = task_data.get("releaseId")
+        group_id = task_data.get("groupId")
+        
+        mongo_client = None
+        
+        # Define the Redis lock key for this task
+        redis_lock_key = f"reflow:task_lock:{task_id}"
+
+        try:
+            mongo_client = get_mongo_client(APPROVER_NAME)
+            db = mongo_client[MONGO_DB_NAME]
+
+            # --- Acquire Redis Lock (Advisory Lock) ---
+            if redis_client: # Only attempt if client was successfully initialized
+                try:
+                    lock_acquired = redis_client.set(redis_lock_key, "locked_by_airflow", nx=True, ex=REDIS_LOCK_TTL_SECONDS)
+
+                    if not lock_acquired:
+                        print(f"[{APPROVER_NAME}] Task {task_id} is already locked by another process (Redis lock '{redis_lock_key}'). Gracefully exiting.")
+                        return # Exit gracefully
+                    
+                    print(f"[{APPROVER_NAME}] Redis lock acquired for task {task_id}: '{redis_lock_key}'.")
+
+                except redis.exceptions.ConnectionError as e:
+                    print(f"[{APPROVER_NAME}] WARNING: Redis connection error during lock acquisition for {task_id}. Proceeding without Redis lock. {e}")
+                except Exception as e:
+                    print(f"[{APPROVER_NAME}] WARNING: Unexpected error acquiring Redis lock for {task_id}. Proceeding without Redis lock. {e}")
+            else:
+                print(f"[{APPROVER_NAME}] Redis client not available. Proceeding without Redis lock for task {task_id}.")
+
+
+            # 1. CRITICAL: EAGER, ATOMIC CLAIMING LOCK IN MONGODB (Authoritative Lock)
+            print(f"[{APPROVER_NAME}] Attempting to claim task {task_id} by transitioning from QUEUED to IN_PROGRESS in MongoDB...")
+            
+            claim_success = update_entity_state_in_mongodb(db, "tasks", task_id, STATE_IN_PROGRESS,
+                                                           old_state_condition=STATE_QUEUED,
+                                                           additional_fields={"reason": f"Automatically moved to IN_PROGRESS by {APPROVER_NAME}"},
+                                                           approver_name=APPROVER_NAME)
+            
+            if not claim_success:
+                print(f"[{APPROVER_NAME}] Task {task_id} could not be claimed in MongoDB (state not QUEUED or already claimed). Releasing Redis lock (if held) and gracefully exiting.")
+                if redis_client: # Only attempt to delete if client is available
+                    try:
+                        redis_client.delete(redis_lock_key) # Release Redis lock if DB claim failed
+                        print(f"[{APPROVER_NAME}] Redis lock '{redis_lock_key}' released after failed MongoDB claim.")
+                    except Exception as e:
+                        print(f"[{APPROVER_NAME}] WARNING: Error releasing Redis lock after failed MongoDB claim: {e}")
+                return # Exit gracefully, another process is handling it
+
+            print(f"[{APPROVER_NAME}] Task {task_id} successfully claimed and set to IN_PROGRESS in MongoDB.")
+
+            # --- Handle different task types ---
+            final_task_state = STATE_IN_PROGRESS # Default, will be updated by handlers
+
+            if task_type == TASK_TYPE_REGULAR:
+                final_task_state = _handle_regular_task(db, task_data)
+            elif task_type == TASK_TYPE_APPROVAL:
+                final_task_state = _handle_approval_task(db, task_data)
+            elif task_type == TASK_TYPE_PARALLEL_GROUP:
+                final_task_state = _handle_parallel_group_task(db, task_data)
+            elif task_type == TASK_TYPE_SEQUENTIAL_GROUP:
+                final_task_state = _handle_sequential_group_task(db, task_data)
+            elif task_type == TASK_TYPE_TRIGGER:
+                final_task_state = _handle_trigger_task(db, task_data)
+            elif task_type == TASK_TYPE_SCHEDULER:
+                final_task_state = _handle_scheduler_task(db, task_data)
+            else:
+                print(f"[{APPROVER_NAME}] Unhandled task type: {task_type} for task {task_id}. Publishing FAILED event.")
+                _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_FAILED, f"Unhandled task type '{task_type}' by {APPROVER_NAME}.")
+                final_task_state = STATE_FAILED
+
+            # --- Post-completion Workflow Orchestration Logic ---
+            # Re-fetch the task to get its latest state (especially for TRIGGER tasks or if external systems updated it)
+            current_task_after_execution = db.tasks.find_one({"_id": task_id})
+            if not current_task_after_execution:
+                print(f"[{APPROVER_NAME}] Task {task_id} not found in DB after execution. Cannot proceed with follow-up logic.")
+                raise AirflowFailException(f"Task {task_id} not found in DB after execution.")
+
+            # If the task is not yet in a terminal state (e.g., REGULAR tasks that just ran JAR, or group tasks that initiated children)
+            # and the JAR execution (if applicable) indicates success, explicitly mark it COMPLETED.
+            # This handles cases where the JAR doesn't update the state itself.
+            if final_task_state == STATE_COMPLETED and current_task_after_execution.get("state") not in get_terminal_states():
+                print(f"[{APPROVER_NAME}] Task {task_id} JAR exited successfully but task state not terminal. Marked COMPLETED by DAG.")
+                _publish_state_change_event("Task", task_id, current_task_after_execution.get("state"), STATE_COMPLETED,
+                                            f"JAR exited successfully but task state not terminal. Marked COMPLETED by DAG. ({APPROVER_NAME})")
+                current_task_after_execution["state"] = STATE_COMPLETED # Update local dict for subsequent logic
+
+            elif final_task_state == STATE_FAILED and current_task_after_execution.get("state") not in get_terminal_states():
+                print(f"[{APPROVER_NAME}] Task {task_id} JAR execution failed but task state not terminal. Marked FAILED by DAG.")
+                _publish_state_change_event("Task", task_id, current_task_after_execution.get("state"), STATE_FAILED,
+                                            f"JAR execution failed: JAR execution for {task_id} reported failure (exit code 1). Stderr: {task_data.get('logs', 'No stderr available')}. ({APPROVER_NAME})")
+                current_task_after_execution["state"] = STATE_FAILED # Update local dict for subsequent logic
+
+
+            # Only queue next task and check parent states if the task is now in a terminal state (COMPLETED, FAILED, SKIPPED, REJECTED, APPROVED)
+            if current_task_after_execution.get("state") in get_terminal_states():
+                _queue_next_task_after_completion(db, current_task_after_execution)
+                _check_and_transition_parent_states(db, task_id, phase_id, group_id)
+            else:
+                print(f"[{APPROVER_NAME}] Task {task_id} is in non-terminal state {current_task_after_execution.get('state')}. Skipping next task queuing and parent state checks for now.")
+            
+
+        except AirflowRescheduleException:
+            # If task defers, the Redis lock has a TTL, so it will eventually expire.
+            # No explicit release needed here for deferral, as the task will resume and re-attempt.
+            print(f"[{APPROVER_NAME}] Task {task_id} deferred. Redis lock '{redis_lock_key}' will expire automatically.")
+            raise # Re-raise to Airflow
+
+        except (ConnectionFailure, OperationFailure) as e:
+            print(f"[{APPROVER_NAME}] MongoDB connection/operation failed: {e}")
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_FAILED, f"Airflow execution failed due to MongoDB error: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Task execution failed for {task_id} due to MongoDB error: {e}")
+        except Exception as e:
+            print(f"[{APPROVER_NAME}] Unexpected error during task {task_id} execution: {e}")
+            _publish_state_change_event("Task", task_id, STATE_IN_PROGRESS, STATE_FAILED, f"Airflow execution failed due to unexpected error: {e}")
+            raise AirflowFailException(f"[{APPROVER_NAME}] Unexpected error for {task_id}: {e}")
+        finally:
+            if mongo_client:
+                mongo_client.close()
+                print(f"[{APPROVER_NAME}] MongoDB client closed.")
+            
+            # Ensure Redis lock is released on successful completion or final failure
+            # (excluding deferrals, where it should remain until TTL)
+            # This block runs for COMPLETED/FAILED states.
+            if redis_client and not isinstance(sys.exc_info()[1], AirflowRescheduleException):
+                try:
+                    # Only delete if this instance actually acquired the lock
+                    # This check is technically redundant if `lock_acquired` was used,
+                    # but provides extra safety if the flow diverged.
+                    # A more robust check might involve comparing the value of the lock.
+                    if redis_client.get(redis_lock_key) == "locked_by_airflow":
+                         redis_client.delete(redis_lock_key)
+                         print(f"[{APPROVER_NAME}] Redis lock '{redis_lock_key}' released in finally block.")
+                    else:
+                        print(f"[{APPROVER_NAME}] Redis lock '{redis_lock_key}' not held by this instance or already expired/released.")
+                except Exception as e:
+                    print(f"[{APPROVER_NAME}] WARNING: Error releasing Redis lock in finally block: {e}")
+
+
+    # --- DAG Flow ---
+    publish_tasks_to_kafka = poll_db_and_publish_to_kafka()
+    kafka_events = consume_kafka_events()
+    execute_tasks = execute_and_transition_task.partial().expand(task_data=kafka_events)
+
+    publish_tasks_to_kafka >> kafka_events >> execute_tasks
+
+# Instantiate the DAG
+reflow_kafka_task_executor_dag_v4()
